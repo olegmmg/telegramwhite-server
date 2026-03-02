@@ -189,15 +189,16 @@ class DB:
         self._run("DELETE FROM sessions WHERE token=%s", (token,))
 
     # ── Чаты ────────────────────────────────────────
-def user_chats(self, uid):
-    return self._all("""
-        SELECT c.id, c.name, c.type,
-               (SELECT text FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_msg,
-               (SELECT created_at FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_time
-        FROM chats c JOIN chat_members cm ON cm.chat_id=c.id
-        WHERE cm.user_id=%s 
-        ORDER BY COALESCE((SELECT created_at FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1), 0) DESC
-    """, (uid,))
+    def user_chats(self, uid):
+        return self._all("""
+            SELECT c.id, c.name, c.type,
+                   (SELECT text FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_msg,
+                   (SELECT created_at FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_time
+            FROM chats c 
+            JOIN chat_members cm ON cm.chat_id = c.id
+            WHERE cm.user_id = %s 
+            ORDER BY COALESCE((SELECT created_at FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1), 0) DESC
+        """, (uid,))
 
     def get_or_create_private(self, uid1, uid2, name2):
         now = int(time.time())
@@ -205,18 +206,18 @@ def user_chats(self, uid):
         try:
             cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cur.execute("""
-                SELECT c.id,c.name FROM chats c
-                JOIN chat_members a ON a.chat_id=c.id AND a.user_id=%s
-                JOIN chat_members b ON b.chat_id=c.id AND b.user_id=%s
-                WHERE c.type='private' LIMIT 1
+                SELECT c.id, c.name FROM chats c
+                JOIN chat_members a ON a.chat_id = c.id AND a.user_id = %s
+                JOIN chat_members b ON b.chat_id = c.id AND b.user_id = %s
+                WHERE c.type = 'private' LIMIT 1
             """, (uid1, uid2))
             ex = cur.fetchone()
             if ex:
                 return dict(ex)
-            cur.execute("INSERT INTO chats (name,type,created_by,created_at) VALUES (%s,'private',%s,%s) RETURNING id,name",
+            cur.execute("INSERT INTO chats (name,type,created_by,created_at) VALUES (%s,'private',%s,%s) RETURNING id, name",
                         (name2, uid1, now))
             chat = dict(cur.fetchone())
-            cur.execute("INSERT INTO chat_members (chat_id,user_id,joined_at) VALUES (%s,%s,%s),(%s,%s,%s)",
+            cur.execute("INSERT INTO chat_members (chat_id,user_id,joined_at) VALUES (%s,%s,%s), (%s,%s,%s)",
                         (chat['id'], uid1, now, chat['id'], uid2, now))
             c.commit()
             return chat
@@ -270,12 +271,11 @@ async def send(ws, data):
 
 async def broadcast(data, chat_id=None, skip=None):
     msg = json.dumps(data, ensure_ascii=False, default=str)
-    if chat_id is None:
-        targets = [info["ws"] for uid, info in conns.items() if info["ws"] is not skip]
-    else:
-        members = db._all("SELECT user_id FROM chat_members WHERE chat_id=%s", (chat_id,))
-        member_ids = {m["user_id"] for m in members}
-        targets = [info["ws"] for uid, info in conns.items() if info["ws"] is not skip and uid in member_ids]
+    targets = [
+        info["ws"] for uid, info in conns.items()
+        if info["ws"] is not skip
+        and (chat_id is None or info.get("current_chat") == chat_id)
+    ]
     if targets:
         await asyncio.gather(*[t.send(msg) for t in targets], return_exceptions=True)
 
@@ -394,11 +394,9 @@ async def handler(ws):
                                 "messages": msgs})
                 if target['id'] in conns:
                     my_name = conns[uid]["username"]
-                    # Имя чата у получателя = имя того кто написал
                     await send(conns[target['id']]["ws"], {
                         "type": "new_private_chat",
-                        "chat": {"id": chat["id"], "name": my_name, "type": "private"},
-                        "messages": db.get_msgs(chat["id"])
+                        "chat": {"id": chat["id"], "name": my_name, "type": "private"}
                     })
 
             elif t == "logout":
