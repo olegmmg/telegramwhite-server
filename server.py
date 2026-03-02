@@ -189,14 +189,15 @@ class DB:
         self._run("DELETE FROM sessions WHERE token=%s", (token,))
 
     # ── Чаты ────────────────────────────────────────
-    def user_chats(self, uid):
-        return self._all("""
-            SELECT c.id, c.name, c.type,
-                   (SELECT text FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_msg,
-                   (SELECT created_at FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_time
-            FROM chats c JOIN chat_members cm ON cm.chat_id=c.id
-            WHERE cm.user_id=%s ORDER BY COALESCE(last_time,0) DESC
-        """, (uid,))
+def user_chats(self, uid):
+    return self._all("""
+        SELECT c.id, c.name, c.type,
+               (SELECT text FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_msg,
+               (SELECT created_at FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_time
+        FROM chats c JOIN chat_members cm ON cm.chat_id=c.id
+        WHERE cm.user_id=%s 
+        ORDER BY COALESCE((SELECT created_at FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1), 0) DESC
+    """, (uid,))
 
     def get_or_create_private(self, uid1, uid2, name2):
         now = int(time.time())
