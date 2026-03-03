@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TelegramWhite WebSocket Server - Полная версия с WebRTC поддержкой
+TelegramWhite WebSocket Server - Исправленная версия с загрузкой всех чатов
 """
 
 import os
@@ -453,11 +453,11 @@ class Database:
                        ) as reactions
                 FROM messages m
                 WHERE m.chat_id = %s AND m.deleted = FALSE
-                ORDER BY m.created_at DESC
+                ORDER BY m.created_at ASC
                 LIMIT %s
             """, (chat_id, limit), fetch_all=True)
         
-        return list(reversed(msgs)) if msgs else []
+        return msgs if msgs else []
 
     def save_message(self, chat_id: int, user_id: int, username: str, text: str) -> dict:
         """Сохранение сообщения"""
@@ -808,7 +808,7 @@ class TelegramWhiteServer:
             # Сохраняем соединение
             self.connections[user['id']] = Connection(ws, user['id'], username)
             
-            # Отправляем данные
+            # Отправляем данные пользователя
             chats = self.db.get_user_chats(user['id'])
             await self.send(ws, {
                 'type': 'logged_in',
@@ -817,12 +817,15 @@ class TelegramWhiteServer:
                 'chats': chats
             })
             
-            # Отправляем историю общего чата
-            await self.send(ws, {
-                'type': 'history',
-                'chat_id': 1,
-                'messages': self.db.get_messages(1)
-            })
+            # Отправляем историю ВСЕХ чатов пользователя
+            for chat in chats:
+                messages = self.db.get_messages(chat['id'])
+                await self.send(ws, {
+                    'type': 'history',
+                    'chat_id': chat['id'],
+                    'messages': messages
+                })
+                log.info(f"📜 Отправлена история чата {chat['id']} ({len(messages)} сообщений)")
             
             # Оповещаем всех
             await self.broadcast_online()
@@ -860,13 +863,15 @@ class TelegramWhiteServer:
                 'chats': chats
             })
             
-            # Отправляем историю всех чатов
+            # Отправляем историю ВСЕХ чатов
             for chat in chats:
+                messages = self.db.get_messages(chat['id'])
                 await self.send(ws, {
                     'type': 'history',
                     'chat_id': chat['id'],
-                    'messages': self.db.get_messages(chat['id'])
+                    'messages': messages
                 })
+                log.info(f"📜 Отправлена история чата {chat['id']} ({len(messages)} сообщений)")
             
             await self.broadcast_online()
             log.info(f"✅ Восстановлена сессия: {user['username']}")
@@ -915,12 +920,7 @@ class TelegramWhiteServer:
         if msg_type == 'switch_chat':
             chat_id = data.get('chat_id', 1)
             conn.current_chat = chat_id
-            messages = self.db.get_messages(chat_id)
-            await self.send(ws, {
-                'type': 'history',
-                'chat_id': chat_id,
-                'messages': messages
-            })
+            # Не отправляем историю при смене чата, так как она уже должна быть
             return
 
         # Печатает...
