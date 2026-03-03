@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TelegramWhite WebSocket Server - Исправленная версия
+TelegramWhite WebSocket Server - Полная версия с WebRTC поддержкой
 """
 
 import os
@@ -11,6 +11,7 @@ import hashlib
 import time
 import logging
 from typing import Dict, Optional, Set, Any
+from datetime import datetime
 
 import websockets
 import psycopg2
@@ -36,6 +37,7 @@ MAX_MESSAGE_LENGTH = 4096
 PING_INTERVAL = 25
 PING_TIMEOUT = 10
 SESSION_TTL = 30 * 24 * 60 * 60  # 30 дней
+MAX_HISTORY = 100  # Максимальное количество сообщений в истории
 
 
 class Database:
@@ -189,6 +191,18 @@ class Database:
                 created_at  BIGINT NOT NULL,
                 PRIMARY KEY (message_id, user_id)
             );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_time 
+            ON messages(chat_id, created_at DESC);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_users_status 
+            ON users(status);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires 
+            ON sessions(expires_at);
             """
         ]
 
@@ -279,12 +293,19 @@ class Database:
         """Проверка логина и пароля"""
         hashed = self.hash_password(password)
         
-        return self.execute("""
+        user = self.execute("""
             SELECT id, username, email, bio, avatar_url, phone, created_at,
                    messages_count, friends_count
             FROM users
             WHERE username = %s AND password = %s
         """, (username, hashed), fetch_one=True)
+        
+        if user:
+            log.info(f"✅ Успешная верификация: {username}")
+        else:
+            log.warning(f"❌ Неудачная верификация: {username}")
+        
+        return user
 
     def get_user(self, user_id: int) -> Optional[dict]:
         """Получение пользователя по ID"""
@@ -317,7 +338,8 @@ class Database:
         try:
             self.execute(query, list(updates.values()) + [user_id])
             return True
-        except:
+        except Exception as e:
+            log.error(f"❌ Ошибка обновления профиля: {e}")
             return False
 
     def change_password(self, user_id: int, old_password: str, new_password: str) -> bool:
@@ -396,7 +418,7 @@ class Database:
             ) DESC
         """, (user_id,), fetch_all=True)
 
-    def get_messages(self, chat_id: int, limit: int = 50, before_id: int = None) -> list:
+    def get_messages(self, chat_id: int, limit: int = MAX_HISTORY, before_id: int = None) -> list:
         """Получение сообщений чата"""
         if before_id:
             msgs = self.execute("""
@@ -466,6 +488,15 @@ class Database:
             DO UPDATE SET emoji = %s
         """, (message_id, user_id, emoji, int(time.time()), emoji))
 
+    def get_reactions(self, message_id: int) -> list:
+        """Получение реакций на сообщение"""
+        return self.execute("""
+            SELECT emoji, COUNT(*) as count 
+            FROM reactions 
+            WHERE message_id = %s 
+            GROUP BY emoji
+        """, (message_id,), fetch_all=True)
+
     def get_online_users(self) -> list:
         """Получение списка онлайн пользователей"""
         return self.execute("""
@@ -493,6 +524,7 @@ class Database:
             """, (user1_id, user2_id), fetch_one=True)
             
             if existing:
+                log.info(f"✅ Найден существующий личный чат {existing['id']}")
                 return existing
             
             # Создаем новый чат в транзакции
@@ -638,6 +670,7 @@ class Database:
                 SET status = 'ended', ended_at = %s, duration = %s
                 WHERE id = %s
             """, (now, duration, call_id))
+            log.info(f"✅ Звонок {call_id} завершен, длительность: {duration}с")
 
 
 class Connection:
@@ -655,7 +688,7 @@ class TelegramWhiteServer:
     
     def __init__(self):
         log.info("=" * 50)
-        log.info("🚀 TelegramWhite Server (Исправленная версия)")
+        log.info("🚀 TelegramWhite Server (Полная версия с WebRTC)")
         log.info("=" * 50)
         log.info(f"Порт: {PORT}")
         
@@ -875,6 +908,7 @@ class TelegramWhiteServer:
                 'chat_id': chat_id,
                 'messages': messages
             })
+            log.info(f"📜 Отправлена история чата {chat_id} ({len(messages)} сообщений)")
             return
 
         # Смена чата
@@ -908,11 +942,7 @@ class TelegramWhiteServer:
             if message_id and emoji:
                 self.db.add_reaction(message_id, user_id, emoji)
                 # Отправляем обновленные реакции
-                reactions = self.db.execute(
-                    "SELECT emoji, COUNT(*) as count FROM reactions WHERE message_id = %s GROUP BY emoji",
-                    (message_id,),
-                    fetch_all=True
-                )
+                reactions = self.db.get_reactions(message_id)
                 await self.broadcast({
                     'type': 'reactions_updated',
                     'message_id': message_id,
@@ -1146,7 +1176,7 @@ class TelegramWhiteServer:
                 'call_type': call_type
             })
             
-            log.info(f"📞 Звонок начат: {call_type} в чате {chat_id}")
+            log.info(f"📞 Звонок начат: {call_type} в чате {chat_id} (ID: {call['id']})")
             return
 
         if msg_type == 'call_accept':
@@ -1186,6 +1216,10 @@ class TelegramWhiteServer:
                     'by': conn.username
                 })
             
+            # Удаляем звонок из активных
+            del self.active_calls[call_id]
+            self.db.end_call(call_id)
+            
             log.info(f"📞 Звонок {call_id} отклонен пользователем {conn.username}")
             return
 
@@ -1215,6 +1249,7 @@ class TelegramWhiteServer:
                     'from_id': user_id,
                     'from_name': conn.username
                 })
+                log.info(f"🔄 Передан offer от {user_id} к {target_id}")
             return
             
         if msg_type == 'webrtc_answer':
@@ -1226,6 +1261,7 @@ class TelegramWhiteServer:
                     'answer': data.get('answer'),
                     'from_id': user_id
                 })
+                log.info(f"🔄 Передан answer от {user_id} к {target_id}")
             return
             
         if msg_type == 'webrtc_ice':
