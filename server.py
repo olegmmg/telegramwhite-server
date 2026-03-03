@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TelegramWhite WebSocket Server - Исправленная версия с загрузкой всех чатов
+TelegramWhite WebSocket Server - Исправленная версия с сохранением сообщений
 """
 
 import os
@@ -220,6 +220,7 @@ class Database:
                     "INSERT INTO chats (id, name, type, description, created_at) VALUES (1, 'Общий чат', 'group', 'Добро пожаловать!', %s)",
                     (int(time.time()),)
                 )
+                log.info("✅ Создан общий чат")
             
             conn.commit()
             log.info("✅ Таблицы созданы/проверены")
@@ -420,93 +421,118 @@ class Database:
 
     def get_messages(self, chat_id: int, limit: int = MAX_HISTORY, before_id: int = None) -> list:
         """Получение сообщений чата"""
-        if before_id:
-            msgs = self.execute("""
-                SELECT m.*, 
-                       (
-                           SELECT json_object_agg(emoji, cnt)
-                           FROM (
-                               SELECT emoji, COUNT(*) as cnt
-                               FROM reactions
-                               WHERE message_id = m.id
-                               GROUP BY emoji
-                           ) r
-                       ) as reactions
-                FROM messages m
-                WHERE m.chat_id = %s 
-                    AND m.deleted = FALSE
-                    AND m.id < %s
-                ORDER BY m.created_at DESC
-                LIMIT %s
-            """, (chat_id, before_id, limit), fetch_all=True)
-        else:
-            msgs = self.execute("""
-                SELECT m.*, 
-                       (
-                           SELECT json_object_agg(emoji, cnt)
-                           FROM (
-                               SELECT emoji, COUNT(*) as cnt
-                               FROM reactions
-                               WHERE message_id = m.id
-                               GROUP BY emoji
-                           ) r
-                       ) as reactions
-                FROM messages m
-                WHERE m.chat_id = %s AND m.deleted = FALSE
-                ORDER BY m.created_at ASC
-                LIMIT %s
-            """, (chat_id, limit), fetch_all=True)
-        
-        return msgs if msgs else []
+        try:
+            if before_id:
+                msgs = self.execute("""
+                    SELECT m.*, 
+                           (
+                               SELECT json_object_agg(emoji, cnt)
+                               FROM (
+                                   SELECT emoji, COUNT(*) as cnt
+                                   FROM reactions
+                                   WHERE message_id = m.id
+                                   GROUP BY emoji
+                               ) r
+                           ) as reactions
+                    FROM messages m
+                    WHERE m.chat_id = %s 
+                        AND m.deleted = FALSE
+                        AND m.id < %s
+                    ORDER BY m.created_at ASC
+                    LIMIT %s
+                """, (chat_id, before_id, limit), fetch_all=True)
+            else:
+                msgs = self.execute("""
+                    SELECT m.*, 
+                           (
+                               SELECT json_object_agg(emoji, cnt)
+                               FROM (
+                                   SELECT emoji, COUNT(*) as cnt
+                                   FROM reactions
+                                   WHERE message_id = m.id
+                                   GROUP BY emoji
+                               ) r
+                           ) as reactions
+                    FROM messages m
+                    WHERE m.chat_id = %s AND m.deleted = FALSE
+                    ORDER BY m.created_at ASC
+                    LIMIT %s
+                """, (chat_id, limit), fetch_all=True)
+            
+            log.info(f"📥 Загружено {len(msgs) if msgs else 0} сообщений из чата {chat_id}")
+            return msgs if msgs else []
+            
+        except Exception as e:
+            log.error(f"❌ Ошибка получения сообщений: {e}")
+            return []
 
-    def save_message(self, chat_id: int, user_id: int, username: str, text: str) -> dict:
+    def save_message(self, chat_id: int, user_id: int, username: str, text: str) -> Optional[dict]:
         """Сохранение сообщения"""
-        msg = self.execute("""
-            INSERT INTO messages (chat_id, user_id, username, text, created_at)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id, chat_id, user_id, username, text, created_at
-        """, (chat_id, user_id, username, text, int(time.time())), fetch_one=True)
+        try:
+            now = int(time.time())
+            msg = self.execute("""
+                INSERT INTO messages (chat_id, user_id, username, text, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, chat_id, user_id, username, text, created_at
+            """, (chat_id, user_id, username, text, now), fetch_one=True)
 
-        # Обновляем счетчики
-        self.execute(
-            "UPDATE users SET messages_count = messages_count + 1 WHERE id = %s",
-            (user_id,)
-        )
-        self.execute(
-            "UPDATE chats SET messages_count = messages_count + 1 WHERE id = %s",
-            (chat_id,)
-        )
-
-        return msg
+            if msg:
+                # Обновляем счетчики
+                self.execute(
+                    "UPDATE users SET messages_count = messages_count + 1 WHERE id = %s",
+                    (user_id,)
+                )
+                self.execute(
+                    "UPDATE chats SET messages_count = messages_count + 1 WHERE id = %s",
+                    (chat_id,)
+                )
+                log.info(f"💾 Сообщение сохранено в чат {chat_id} (ID: {msg['id']})")
+            
+            return msg
+            
+        except Exception as e:
+            log.error(f"❌ Ошибка сохранения сообщения: {e}")
+            return None
 
     def add_reaction(self, message_id: int, user_id: int, emoji: str):
         """Добавление реакции"""
-        self.execute("""
-            INSERT INTO reactions (message_id, user_id, emoji, created_at)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (message_id, user_id) 
-            DO UPDATE SET emoji = %s
-        """, (message_id, user_id, emoji, int(time.time()), emoji))
+        try:
+            self.execute("""
+                INSERT INTO reactions (message_id, user_id, emoji, created_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (message_id, user_id) 
+                DO UPDATE SET emoji = %s
+            """, (message_id, user_id, emoji, int(time.time()), emoji))
+        except Exception as e:
+            log.error(f"❌ Ошибка добавления реакции: {e}")
 
     def get_reactions(self, message_id: int) -> list:
         """Получение реакций на сообщение"""
-        return self.execute("""
-            SELECT emoji, COUNT(*) as count 
-            FROM reactions 
-            WHERE message_id = %s 
-            GROUP BY emoji
-        """, (message_id,), fetch_all=True)
+        try:
+            return self.execute("""
+                SELECT emoji, COUNT(*) as count 
+                FROM reactions 
+                WHERE message_id = %s 
+                GROUP BY emoji
+            """, (message_id,), fetch_all=True) or []
+        except Exception as e:
+            log.error(f"❌ Ошибка получения реакций: {e}")
+            return []
 
     def get_online_users(self) -> list:
         """Получение списка онлайн пользователей"""
-        return self.execute("""
-            SELECT id, username, avatar_url, status
-            FROM users
-            WHERE status = 'online'
-            ORDER BY username
-        """, fetch_all=True)
+        try:
+            return self.execute("""
+                SELECT id, username, avatar_url, status
+                FROM users
+                WHERE status = 'online'
+                ORDER BY username
+            """, fetch_all=True) or []
+        except Exception as e:
+            log.error(f"❌ Ошибка получения онлайн пользователей: {e}")
+            return []
 
-    def get_or_create_private(self, user1_id: int, user2_id: int, user2_name: str) -> dict:
+    def get_or_create_private(self, user1_id: int, user2_id: int, user2_name: str) -> Optional[dict]:
         """Получение или создание личного чата"""
         now = int(time.time())
         
@@ -559,7 +585,7 @@ class Database:
                 
         except Exception as e:
             log.error(f"❌ Ошибка создания личного чата: {e}")
-            raise
+            return None
 
     def create_group(self, name: str, description: str, creator_id: int, members: list) -> Optional[dict]:
         """Создание группы"""
@@ -629,48 +655,61 @@ class Database:
                     ELSE 3
                 END,
                 u.username
-        """, (chat_id,), fetch_all=True)
+        """, (chat_id,), fetch_all=True) or []
 
     def add_member(self, chat_id: int, user_id: int):
         """Добавление участника в чат"""
-        self.execute("""
-            INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-            VALUES (%s, %s, 'member', %s)
-            ON CONFLICT DO NOTHING
-        """, (chat_id, user_id, int(time.time())))
+        try:
+            self.execute("""
+                INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+                VALUES (%s, %s, 'member', %s)
+                ON CONFLICT DO NOTHING
+            """, (chat_id, user_id, int(time.time())))
+        except Exception as e:
+            log.error(f"❌ Ошибка добавления участника: {e}")
 
     def remove_member(self, chat_id: int, user_id: int):
         """Удаление участника из чата"""
-        self.execute("""
-            DELETE FROM chat_members
-            WHERE chat_id = %s AND user_id = %s
-        """, (chat_id, user_id))
+        try:
+            self.execute("""
+                DELETE FROM chat_members
+                WHERE chat_id = %s AND user_id = %s
+            """, (chat_id, user_id))
+        except Exception as e:
+            log.error(f"❌ Ошибка удаления участника: {e}")
 
     def create_call(self, chat_id: int, initiator_id: int, call_type: str = 'audio') -> Optional[dict]:
         """Создание звонка"""
-        return self.execute("""
-            INSERT INTO calls (chat_id, initiator, type, status, started_at)
-            VALUES (%s, %s, %s, 'ringing', %s)
-            RETURNING id, chat_id, type, status, started_at
-        """, (chat_id, initiator_id, call_type, int(time.time())), fetch_one=True)
+        try:
+            return self.execute("""
+                INSERT INTO calls (chat_id, initiator, type, status, started_at)
+                VALUES (%s, %s, %s, 'ringing', %s)
+                RETURNING id, chat_id, type, status, started_at
+            """, (chat_id, initiator_id, call_type, int(time.time())), fetch_one=True)
+        except Exception as e:
+            log.error(f"❌ Ошибка создания звонка: {e}")
+            return None
 
     def end_call(self, call_id: int):
         """Завершение звонка"""
-        now = int(time.time())
-        call = self.execute(
-            "SELECT started_at FROM calls WHERE id = %s",
-            (call_id,),
-            fetch_one=True
-        )
-        
-        if call:
-            duration = now - call['started_at']
-            self.execute("""
-                UPDATE calls 
-                SET status = 'ended', ended_at = %s, duration = %s
-                WHERE id = %s
-            """, (now, duration, call_id))
-            log.info(f"✅ Звонок {call_id} завершен, длительность: {duration}с")
+        try:
+            now = int(time.time())
+            call = self.execute(
+                "SELECT started_at FROM calls WHERE id = %s",
+                (call_id,),
+                fetch_one=True
+            )
+            
+            if call:
+                duration = now - call['started_at']
+                self.execute("""
+                    UPDATE calls 
+                    SET status = 'ended', ended_at = %s, duration = %s
+                    WHERE id = %s
+                """, (now, duration, call_id))
+                log.info(f"✅ Звонок {call_id} завершен, длительность: {duration}с")
+        except Exception as e:
+            log.error(f"❌ Ошибка завершения звонка: {e}")
 
 
 class Connection:
@@ -688,7 +727,7 @@ class TelegramWhiteServer:
     
     def __init__(self):
         log.info("=" * 50)
-        log.info("🚀 TelegramWhite Server (Полная версия с WebRTC)")
+        log.info("🚀 TelegramWhite Server (Исправленная версия)")
         log.info("=" * 50)
         log.info(f"Порт: {PORT}")
         
@@ -808,8 +847,11 @@ class TelegramWhiteServer:
             # Сохраняем соединение
             self.connections[user['id']] = Connection(ws, user['id'], username)
             
-            # Отправляем данные пользователя
+            # Получаем все чаты пользователя
             chats = self.db.get_user_chats(user['id'])
+            log.info(f"📋 Найдено чатов: {len(chats)}")
+            
+            # Отправляем данные пользователя
             await self.send(ws, {
                 'type': 'logged_in',
                 'user': user,
@@ -857,6 +899,8 @@ class TelegramWhiteServer:
             self.connections[user_id] = Connection(ws, user_id, user['username'])
             
             chats = self.db.get_user_chats(user_id)
+            log.info(f"📋 Найдено чатов: {len(chats)}")
+            
             await self.send(ws, {
                 'type': 'session_ok',
                 'user': user,
@@ -899,8 +943,9 @@ class TelegramWhiteServer:
                 return
             
             msg = self.db.save_message(chat_id, user_id, conn.username, text)
-            await self.broadcast({'type': 'message', 'message': msg}, chat_id=chat_id)
-            log.info(f"💬 Сообщение от {conn.username} в чат {chat_id}")
+            if msg:
+                await self.broadcast({'type': 'message', 'message': msg}, chat_id=chat_id)
+                log.info(f"💬 Сообщение от {conn.username} в чат {chat_id}")
             return
 
         # Получение истории
@@ -1112,31 +1157,34 @@ class TelegramWhiteServer:
             
             try:
                 chat = self.db.get_or_create_private(user_id, target['id'], target_name)
-                messages = self.db.get_messages(chat['id'])
-                
-                await self.send(ws, {
-                    'type': 'private_chat_created',
-                    'chat': {
-                        'id': chat['id'],
-                        'name': target_name,
-                        'type': 'private'
-                    },
-                    'messages': messages
-                })
-                
-                # Оповещаем собеседника
-                if target['id'] in self.connections:
-                    await self.send(self.connections[target['id']].ws, {
-                        'type': 'new_private_chat',
+                if chat:
+                    messages = self.db.get_messages(chat['id'])
+                    
+                    await self.send(ws, {
+                        'type': 'private_chat_created',
                         'chat': {
                             'id': chat['id'],
-                            'name': conn.username,
+                            'name': target_name,
                             'type': 'private'
                         },
                         'messages': messages
                     })
-                
-                log.info(f"💬 Личный чат: {conn.username} - {target_name}")
+                    
+                    # Оповещаем собеседника
+                    if target['id'] in self.connections:
+                        await self.send(self.connections[target['id']].ws, {
+                            'type': 'new_private_chat',
+                            'chat': {
+                                'id': chat['id'],
+                                'name': conn.username,
+                                'type': 'private'
+                            },
+                            'messages': messages
+                        })
+                    
+                    log.info(f"💬 Личный чат: {conn.username} - {target_name}")
+                else:
+                    await self.send(ws, {'type': 'error', 'message': 'Ошибка создания чата'})
                 
             except Exception as e:
                 log.error(f"❌ Ошибка создания личного чата: {e}")
