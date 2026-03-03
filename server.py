@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 TelegramWhite WebSocket Server for Render
-Liquid Glass Edition - Полноценный мессенджер
+Liquid Glass Edition - Исправленная версия
 """
 
 import os
@@ -58,6 +58,7 @@ class Database:
         self.pool = None
         self.init_pool()
         self.init_tables()
+        self.run_migrations()
 
     def init_pool(self):
         """Инициализация пула соединений"""
@@ -110,6 +111,79 @@ class Database:
             if conn:
                 self.put_conn(conn)
 
+    def run_migrations(self):
+        """Проверка и обновление схемы базы данных"""
+        log.info("🔄 Проверка схемы базы данных...")
+        
+        # Проверяем существование колонок и добавляем если нужно
+        migrations = [
+            # Проверяем колонку avatar_url
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name='users' AND column_name='avatar_url'
+                ) THEN
+                    ALTER TABLE users ADD COLUMN avatar_url TEXT DEFAULT '';
+                END IF;
+            END $$;
+            """,
+            # Проверяем колонку avatar (может быть старое название)
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name='users' AND column_name='avatar'
+                ) THEN
+                    ALTER TABLE users RENAME COLUMN avatar TO avatar_url;
+                END IF;
+            END $$;
+            """,
+            # Проверяем колонку messages_count
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name='users' AND column_name='messages_count'
+                ) THEN
+                    ALTER TABLE users ADD COLUMN messages_count INTEGER DEFAULT 0;
+                END IF;
+            END $$;
+            """,
+            # Проверяем колонку friends_count
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name='users' AND column_name='friends_count'
+                ) THEN
+                    ALTER TABLE users ADD COLUMN friends_count INTEGER DEFAULT 0;
+                END IF;
+            END $$;
+            """
+        ]
+        
+        conn = None
+        try:
+            conn = self.get_conn()
+            cur = conn.cursor()
+            for migration in migrations:
+                try:
+                    cur.execute(migration)
+                except Exception as e:
+                    log.warning(f"⚠️ Миграция пропущена: {e}")
+            conn.commit()
+            log.info("✅ Схема базы данных обновлена")
+        except Exception as e:
+            log.error(f"❌ Ошибка миграции: {e}")
+        finally:
+            if conn:
+                self.put_conn(conn)
+
     def init_tables(self):
         """Создание всех необходимых таблиц"""
         queries = [
@@ -120,7 +194,7 @@ class Database:
                 email           TEXT DEFAULT '',
                 password        TEXT NOT NULL,
                 bio             TEXT DEFAULT '',
-                avatar          TEXT DEFAULT '',
+                avatar_url      TEXT DEFAULT '',
                 phone           TEXT DEFAULT '',
                 status          TEXT DEFAULT 'offline',
                 last_seen       BIGINT NOT NULL,
@@ -135,7 +209,7 @@ class Database:
                 name            TEXT NOT NULL,
                 type            TEXT NOT NULL DEFAULT 'group',
                 description     TEXT DEFAULT '',
-                avatar          TEXT DEFAULT '',
+                avatar_url      TEXT DEFAULT '',
                 created_by      INTEGER REFERENCES users(id),
                 created_at      BIGINT NOT NULL,
                 messages_count  INTEGER DEFAULT 0
@@ -260,7 +334,7 @@ class Database:
             user = self.execute("""
                 INSERT INTO users (username, email, password, last_seen, created_at)
                 VALUES (%s, %s, %s, %s, %s)
-                RETURNING id, username, email, bio, avatar, phone, created_at
+                RETURNING id, username, email, bio, avatar_url, phone, created_at
             """, (username, email, self.hash_password(password), now, now), fetch_one=True)
 
             # Добавляем в общий чат
@@ -280,7 +354,7 @@ class Database:
     def verify_user(self, username: str, password: str) -> Optional[dict]:
         """Проверка логина и пароля"""
         return self.execute("""
-            SELECT id, username, email, bio, avatar, phone, created_at,
+            SELECT id, username, email, bio, avatar_url, phone, created_at,
                    messages_count, friends_count
             FROM users
             WHERE username = %s AND password = %s
@@ -289,7 +363,7 @@ class Database:
     def get_user(self, user_id: int) -> Optional[dict]:
         """Получение пользователя по ID"""
         return self.execute("""
-            SELECT id, username, email, bio, avatar, phone, status,
+            SELECT id, username, email, bio, avatar_url, phone, status,
                    last_seen, created_at, messages_count, friends_count
             FROM users
             WHERE id = %s
@@ -298,14 +372,14 @@ class Database:
     def get_user_by_username(self, username: str) -> Optional[dict]:
         """Получение пользователя по имени"""
         return self.execute("""
-            SELECT id, username, bio, avatar, status, last_seen
+            SELECT id, username, bio, avatar_url, status, last_seen
             FROM users
             WHERE username = %s
         """, (username,), fetch_one=True)
 
     def update_profile(self, user_id: int, **kwargs) -> bool:
         """Обновление профиля пользователя"""
-        allowed = ['bio', 'email', 'phone', 'avatar']
+        allowed = ['bio', 'email', 'phone', 'avatar_url']
         updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
         
         if not updates:
@@ -377,7 +451,7 @@ class Database:
         """Получение всех чатов пользователя"""
         return self.execute("""
             SELECT 
-                c.id, c.name, c.type, c.description, c.avatar,
+                c.id, c.name, c.type, c.description, c.avatar_url,
                 cm.role, cm.last_read,
                 (
                     SELECT row_to_json(msg)
@@ -407,7 +481,7 @@ class Database:
             chat = self.execute("""
                 INSERT INTO chats (name, type, description, created_by, created_at)
                 VALUES (%s, 'group', %s, %s, %s)
-                RETURNING id, name, type, description, avatar, created_at
+                RETURNING id, name, type, description, avatar_url, created_at
             """, (name, description, creator_id, now), fetch_one=True)
 
             # Добавляем создателя
@@ -435,7 +509,7 @@ class Database:
     def get_chat_info(self, chat_id: int) -> Optional[dict]:
         """Получение информации о чате"""
         return self.execute("""
-            SELECT id, name, type, description, avatar, created_by, created_at
+            SELECT id, name, type, description, avatar_url, created_by, created_at
             FROM chats
             WHERE id = %s
         """, (chat_id,), fetch_one=True)
@@ -443,7 +517,7 @@ class Database:
     def get_chat_members(self, chat_id: int) -> list:
         """Получение участников чата"""
         return self.execute("""
-            SELECT u.id, u.username, u.avatar, u.status, cm.role, cm.joined_at
+            SELECT u.id, u.username, u.avatar_url, u.status, cm.role, cm.joined_at
             FROM users u
             JOIN chat_members cm ON cm.user_id = u.id
             WHERE cm.chat_id = %s
@@ -605,7 +679,7 @@ class Database:
     def get_online_users(self) -> list:
         """Получение списка онлайн пользователей"""
         return self.execute("""
-            SELECT id, username, avatar, status
+            SELECT id, username, avatar_url, status
             FROM users
             WHERE status = 'online'
             ORDER BY username
@@ -648,7 +722,7 @@ class TelegramWhiteServer:
         if chat_id:
             # Получаем участников чата
             members = self.db.get_chat_members(chat_id)
-            member_ids = {m['id'] for m in members}
+            member_ids = {m['id'] for m in members} if members else set()
             targets = [
                 conn.ws for uid, conn in self.connections.items()
                 if uid in member_ids and uid != skip_user
@@ -887,7 +961,7 @@ class TelegramWhiteServer:
                 bio=bio,
                 email=email,
                 phone=phone,
-                avatar=avatar
+                avatar_url=avatar
             )
             
             user = self.db.get_user(user_id)
@@ -1191,8 +1265,9 @@ class TelegramWhiteServer:
                     await self.handle_message(ws, data, user_id)
                     
                     # Если это логин или сессия, сохраняем user_id
-                    if data.get('type') in ['login', 'session'] and 'user_id' in data:
-                        user_id = data['user_id']
+                    if data.get('type') in ['login', 'session']:
+                        # user_id будет известен после обработки
+                        pass
                         
                 except json.JSONDecodeError:
                     await self.send(ws, {'type': 'error', 'message': 'Неверный JSON'})
