@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TelegramWhite WebSocket Server - Полная рабочая версия
+TelegramWhite WebSocket Server - Исправленная версия
 """
 
 import os
@@ -479,64 +479,97 @@ class Database:
         """Получение или создание личного чата"""
         now = int(time.time())
         
-        # Ищем существующий чат
-        existing = self.execute("""
-            SELECT c.id, c.name, c.type
-            FROM chats c
-            JOIN chat_members m1 ON m1.chat_id = c.id
-            JOIN chat_members m2 ON m2.chat_id = c.id
-            WHERE c.type = 'private'
-                AND m1.user_id = %s
-                AND m2.user_id = %s
-            LIMIT 1
-        """, (user1_id, user2_id), fetch_one=True)
-        
-        if existing:
-            return existing
-        
-        # Создаем новый
-        chat = self.execute("""
-            INSERT INTO chats (name, type, created_by, created_at)
-            VALUES (%s, 'private', %s, %s)
-            RETURNING id, name, type
-        """, (user2_name, user1_id, now), fetch_one=True)
-
-        # Добавляем участников
-        self.execute("""
-            INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-            VALUES (%s, %s, 'member', %s), (%s, %s, 'member', %s)
-        """, (chat['id'], user1_id, now, chat['id'], user2_id, now))
-
-        return chat
+        try:
+            # Ищем существующий чат
+            existing = self.execute("""
+                SELECT c.id, c.name, c.type
+                FROM chats c
+                JOIN chat_members m1 ON m1.chat_id = c.id
+                JOIN chat_members m2 ON m2.chat_id = c.id
+                WHERE c.type = 'private'
+                    AND m1.user_id = %s
+                    AND m2.user_id = %s
+                LIMIT 1
+            """, (user1_id, user2_id), fetch_one=True)
+            
+            if existing:
+                return existing
+            
+            # Создаем новый чат в транзакции
+            conn = self.get_conn()
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            try:
+                # Создаем чат
+                cur.execute("""
+                    INSERT INTO chats (name, type, created_by, created_at)
+                    VALUES (%s, 'private', %s, %s)
+                    RETURNING id, name, type
+                """, (user2_name, user1_id, now))
+                
+                chat = dict(cur.fetchone())
+                
+                # Добавляем участников
+                cur.execute("""
+                    INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+                    VALUES (%s, %s, 'member', %s), (%s, %s, 'member', %s)
+                """, (chat['id'], user1_id, now, chat['id'], user2_id, now))
+                
+                conn.commit()
+                log.info(f"✅ Создан личный чат {chat['id']} между {user1_id} и {user2_id}")
+                return chat
+                
+            except Exception as e:
+                conn.rollback()
+                raise e
+            finally:
+                self.put_conn(conn)
+                
+        except Exception as e:
+            log.error(f"❌ Ошибка создания личного чата: {e}")
+            raise
 
     def create_group(self, name: str, description: str, creator_id: int, members: list) -> Optional[dict]:
         """Создание группы"""
         now = int(time.time())
         try:
-            # Создаем чат
-            chat = self.execute("""
-                INSERT INTO chats (name, type, description, created_by, created_at)
-                VALUES (%s, 'group', %s, %s, %s)
-                RETURNING id, name, type, description, avatar_url, created_at
-            """, (name, description, creator_id, now), fetch_one=True)
+            conn = self.get_conn()
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            try:
+                # Создаем чат
+                cur.execute("""
+                    INSERT INTO chats (name, type, description, created_by, created_at)
+                    VALUES (%s, 'group', %s, %s, %s)
+                    RETURNING id, name, type, description, avatar_url, created_at
+                """, (name, description, creator_id, now))
+                
+                chat = dict(cur.fetchone())
 
-            # Добавляем создателя
-            self.execute("""
-                INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-                VALUES (%s, %s, 'owner', %s)
-            """, (chat['id'], creator_id, now))
+                # Добавляем создателя
+                cur.execute("""
+                    INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+                    VALUES (%s, %s, 'owner', %s)
+                """, (chat['id'], creator_id, now))
 
-            # Добавляем остальных участников
-            for member_id in members:
-                if member_id != creator_id:
-                    self.execute("""
-                        INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-                        VALUES (%s, %s, 'member', %s)
-                        ON CONFLICT DO NOTHING
-                    """, (chat['id'], member_id, now))
+                # Добавляем остальных участников
+                for member_id in members:
+                    if member_id != creator_id:
+                        cur.execute("""
+                            INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+                            VALUES (%s, %s, 'member', %s)
+                            ON CONFLICT DO NOTHING
+                        """, (chat['id'], member_id, now))
 
-            log.info(f"✅ Группа создана: {name}")
-            return chat
+                conn.commit()
+                log.info(f"✅ Группа создана: {name} (ID: {chat['id']})")
+                return chat
+                
+            except Exception as e:
+                conn.rollback()
+                raise e
+            finally:
+                self.put_conn(conn)
 
         except Exception as e:
             log.error(f"❌ Ошибка создания группы: {e}")
@@ -622,7 +655,7 @@ class TelegramWhiteServer:
     
     def __init__(self):
         log.info("=" * 50)
-        log.info("🚀 TelegramWhite Server (Полная версия)")
+        log.info("🚀 TelegramWhite Server (Исправленная версия)")
         log.info("=" * 50)
         log.info(f"Порт: {PORT}")
         
@@ -795,11 +828,11 @@ class TelegramWhiteServer:
             })
             
             # Отправляем историю всех чатов
-            for chat_id in [c['id'] for c in chats]:
+            for chat in chats:
                 await self.send(ws, {
                     'type': 'history',
-                    'chat_id': chat_id,
-                    'messages': self.db.get_messages(chat_id)
+                    'chat_id': chat['id'],
+                    'messages': self.db.get_messages(chat['id'])
                 })
             
             await self.broadcast_online()
@@ -875,14 +908,15 @@ class TelegramWhiteServer:
             if message_id and emoji:
                 self.db.add_reaction(message_id, user_id, emoji)
                 # Отправляем обновленные реакции
+                reactions = self.db.execute(
+                    "SELECT emoji, COUNT(*) as count FROM reactions WHERE message_id = %s GROUP BY emoji",
+                    (message_id,),
+                    fetch_all=True
+                )
                 await self.broadcast({
                     'type': 'reactions_updated',
                     'message_id': message_id,
-                    'reactions': self.db.execute(
-                        "SELECT emoji, COUNT(*) as count FROM reactions WHERE message_id = %s GROUP BY emoji",
-                        (message_id,),
-                        fetch_all=True
-                    )
+                    'reactions': reactions
                 }, chat_id=chat_id)
             return
 
@@ -965,7 +999,8 @@ class TelegramWhiteServer:
                 if member['id'] in self.connections and member['id'] != user_id:
                     await self.send(self.connections[member['id']].ws, {
                         'type': 'new_group_chat',
-                        'chat': {**chat, 'type': 'group'}
+                        'chat': {**chat, 'type': 'group'},
+                        'messages': []
                     })
             
             await self.send(ws, {
@@ -1015,6 +1050,8 @@ class TelegramWhiteServer:
                 'chat_id': chat_id,
                 'text': f'➕ {username} присоединился к группе'
             }, chat_id=chat_id)
+            
+            log.info(f"➕ {username} добавлен в чат {chat_id}")
             return
 
         # Выход из группы
@@ -1031,6 +1068,7 @@ class TelegramWhiteServer:
             }, chat_id=chat_id)
             
             await self.send(ws, {'type': 'left_chat', 'chat_id': chat_id})
+            log.info(f"👋 {username} покинул чат {chat_id}")
             return
 
         # Личный чат
@@ -1042,32 +1080,37 @@ class TelegramWhiteServer:
                 await self.send(ws, {'type': 'error', 'message': 'Пользователь не найден'})
                 return
             
-            chat = self.db.get_or_create_private(user_id, target['id'], target_name)
-            messages = self.db.get_messages(chat['id'])
-            
-            await self.send(ws, {
-                'type': 'private_chat_created',
-                'chat': {
-                    'id': chat['id'],
-                    'name': target_name,
-                    'type': 'private'
-                },
-                'messages': messages
-            })
-            
-            # Оповещаем собеседника
-            if target['id'] in self.connections:
-                await self.send(self.connections[target['id']].ws, {
-                    'type': 'new_private_chat',
+            try:
+                chat = self.db.get_or_create_private(user_id, target['id'], target_name)
+                messages = self.db.get_messages(chat['id'])
+                
+                await self.send(ws, {
+                    'type': 'private_chat_created',
                     'chat': {
                         'id': chat['id'],
-                        'name': conn.username,
+                        'name': target_name,
                         'type': 'private'
                     },
                     'messages': messages
                 })
-            
-            log.info(f"💬 Личный чат: {conn.username} - {target_name}")
+                
+                # Оповещаем собеседника
+                if target['id'] in self.connections:
+                    await self.send(self.connections[target['id']].ws, {
+                        'type': 'new_private_chat',
+                        'chat': {
+                            'id': chat['id'],
+                            'name': conn.username,
+                            'type': 'private'
+                        },
+                        'messages': messages
+                    })
+                
+                log.info(f"💬 Личный чат: {conn.username} - {target_name}")
+                
+            except Exception as e:
+                log.error(f"❌ Ошибка создания личного чата: {e}")
+                await self.send(ws, {'type': 'error', 'message': 'Ошибка создания чата'})
             return
 
         # Звонки
@@ -1125,6 +1168,7 @@ class TelegramWhiteServer:
                 })
             
             await self.send(ws, {'type': 'call_joined', 'call_id': call_id})
+            log.info(f"📞 Звонок {call_id} принят пользователем {conn.username}")
             return
 
         if msg_type == 'call_decline':
@@ -1141,6 +1185,8 @@ class TelegramWhiteServer:
                     'call_id': call_id,
                     'by': conn.username
                 })
+            
+            log.info(f"📞 Звонок {call_id} отклонен пользователем {conn.username}")
             return
 
         if msg_type == 'call_end':
@@ -1159,17 +1205,36 @@ class TelegramWhiteServer:
             return
 
         # WebRTC сигнализация
-        if msg_type in ['webrtc_offer', 'webrtc_answer', 'webrtc_ice']:
+        if msg_type == 'webrtc_offer':
             target_id = data.get('target_id')
             if target_id in self.connections:
                 await self.send(self.connections[target_id].ws, {
-                    'type': msg_type,
+                    'type': 'webrtc_offer',
                     'call_id': data.get('call_id'),
-                    'offer' if msg_type == 'webrtc_offer' else 
-                    'answer' if msg_type == 'webrtc_answer' else 
-                    'candidate': data.get('offer' if msg_type == 'webrtc_offer' else 
-                                         'answer' if msg_type == 'webrtc_answer' else 
-                                         'candidate'),
+                    'offer': data.get('offer'),
+                    'from_id': user_id,
+                    'from_name': conn.username
+                })
+            return
+            
+        if msg_type == 'webrtc_answer':
+            target_id = data.get('target_id')
+            if target_id in self.connections:
+                await self.send(self.connections[target_id].ws, {
+                    'type': 'webrtc_answer',
+                    'call_id': data.get('call_id'),
+                    'answer': data.get('answer'),
+                    'from_id': user_id
+                })
+            return
+            
+        if msg_type == 'webrtc_ice':
+            target_id = data.get('target_id')
+            if target_id in self.connections:
+                await self.send(self.connections[target_id].ws, {
+                    'type': 'webrtc_ice',
+                    'call_id': data.get('call_id'),
+                    'candidate': data.get('candidate'),
                     'from_id': user_id
                 })
             return
@@ -1182,6 +1247,17 @@ class TelegramWhiteServer:
             
             if user_id in self.connections:
                 username = self.connections[user_id].username
+                
+                # Завершаем активные звонки
+                for call_id, call in list(self.active_calls.items()):
+                    if user_id in call['participants']:
+                        self.db.end_call(call_id)
+                        await self.broadcast({
+                            'type': 'call_ended',
+                            'call_id': call_id
+                        }, chat_id=call['chat_id'])
+                        del self.active_calls[call_id]
+                
                 del self.connections[user_id]
                 self.db.set_status(user_id, 'offline')
                 await self.broadcast_online()
