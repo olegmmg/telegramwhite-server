@@ -1,651 +1,1309 @@
 #!/usr/bin/env python3
 """
-TelegramWhite WebSocket Server v2
-Профили, групповые чаты, WebRTC звонки
-pip install websockets psycopg2-binary
+TelegramWhite WebSocket Server for Render
+Liquid Glass Edition - Полноценный мессенджер
 """
 
-import asyncio, json, hashlib, os, time, logging
-from typing import Dict, Optional
-import websockets, psycopg2, psycopg2.extras
-from psycopg2.pool import ThreadedConnectionPool
+import os
+import sys
+import json
+import asyncio
+import hashlib
+import time
+import logging
+from typing import Dict, Optional, Set, Any
+from datetime import datetime, timedelta
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("TW")
+import websockets
+import psycopg2
+import psycopg2.extras
+from psycopg2.pool import SimpleConnectionPool
+from urllib.parse import urlparse
 
-HOST         = "0.0.0.0"
-PORT         = int(os.environ.get("PORT", 8080))
-SECRET_KEY   = os.environ.get("TW_SECRET", "change-me-please")
+# Настройка логирования для Render
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger("tgwhite")
+
+# Конфигурация для Render
+PORT = int(os.environ.get("PORT", 10000))  # Render использует PORT
+HOST = "0.0.0.0"  # Важно для Render
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-MAX_AVATAR   = 2 * 1024 * 1024  # 2MB
+SECRET_KEY = os.environ.get("TW_SECRET", os.urandom(24).hex())
+
+# Константы
+MAX_MESSAGE_LENGTH = 4096
+PING_INTERVAL = 25
+PING_TIMEOUT = 10
+SESSION_TTL = 30 * 24 * 60 * 60  # 30 дней
 
 
-class DB:
-    def __init__(self, dsn):
-        if dsn.startswith("postgres://"):
-            dsn = dsn.replace("postgres://", "postgresql://", 1)
-        self.pool = ThreadedConnectionPool(1, 20, dsn)
-        self._init()
+class Database:
+    """Управление базой данных PostgreSQL на Render"""
+    
+    def __init__(self, database_url):
+        if not database_url:
+            log.error("❌ DATABASE_URL не задан!")
+            log.error("Добавьте переменную окружения DATABASE_URL в настройках Render")
+            sys.exit(1)
+        
+        # Исправляем URL для PostgreSQL
+        if database_url.startswith("postgres://"):
+            database_url = database_url.replace("postgres://", "postgresql://", 1)
+        
+        self.database_url = database_url
+        self.pool = None
+        self.init_pool()
+        self.init_tables()
 
-    def _conn(self):
-        c = self.pool.getconn()
-        c.autocommit = False
-        return c
-
-    def _release(self, c):
-        self.pool.putconn(c)
-
-    def _init(self):
-        c = self._conn()
+    def init_pool(self):
+        """Инициализация пула соединений"""
         try:
-            cur = c.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id         SERIAL PRIMARY KEY,
-                    username   TEXT   UNIQUE NOT NULL,
-                    email      TEXT   DEFAULT '',
-                    password   TEXT   NOT NULL,
-                    bio        TEXT   DEFAULT '',
-                    avatar_url TEXT   DEFAULT '',
-                    phone      TEXT   DEFAULT '',
-                    status     TEXT   DEFAULT 'offline',
-                    created_at BIGINT NOT NULL,
-                    last_seen  BIGINT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS chats (
-                    id          SERIAL PRIMARY KEY,
-                    name        TEXT   NOT NULL,
-                    type        TEXT   NOT NULL DEFAULT 'group',
-                    description TEXT   DEFAULT '',
-                    avatar_url  TEXT   DEFAULT '',
-                    created_by  INTEGER REFERENCES users(id),
-                    owner_id    INTEGER REFERENCES users(id),
-                    created_at  BIGINT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS chat_members (
-                    chat_id   INTEGER REFERENCES chats(id) ON DELETE CASCADE,
-                    user_id   INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                    role      TEXT   NOT NULL DEFAULT 'member',
-                    joined_at BIGINT NOT NULL,
-                    PRIMARY KEY (chat_id, user_id)
-                );
-                CREATE TABLE IF NOT EXISTS messages (
-                    id         SERIAL PRIMARY KEY,
-                    chat_id    INTEGER REFERENCES chats(id) ON DELETE CASCADE,
-                    user_id    INTEGER REFERENCES users(id),
-                    username   TEXT    NOT NULL,
-                    text       TEXT    NOT NULL,
-                    type       TEXT    DEFAULT 'text',
-                    created_at BIGINT  NOT NULL,
-                    edited_at  BIGINT,
-                    deleted    BOOLEAN DEFAULT FALSE
-                );
-                CREATE TABLE IF NOT EXISTS sessions (
-                    token      TEXT PRIMARY KEY,
-                    user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                    created_at BIGINT NOT NULL,
-                    expires_at BIGINT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS calls (
-                    id         SERIAL PRIMARY KEY,
-                    chat_id    INTEGER REFERENCES chats(id) ON DELETE CASCADE,
-                    initiator  INTEGER REFERENCES users(id),
-                    type       TEXT NOT NULL DEFAULT 'audio',
-                    status     TEXT NOT NULL DEFAULT 'ringing',
-                    started_at BIGINT NOT NULL,
-                    ended_at   BIGINT,
-                    duration   INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS reactions (
-                    message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
-                    user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                    emoji      TEXT NOT NULL,
-                    created_at BIGINT NOT NULL,
-                    PRIMARY KEY (message_id, user_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_msg_chat ON messages(chat_id, created_at);
-                CREATE INDEX IF NOT EXISTS idx_calls    ON calls(chat_id);
-            """)
-            cur.execute("SELECT id FROM chats WHERE id=1 LIMIT 1")
+            self.pool = SimpleConnectionPool(
+                1, 20,
+                self.database_url,
+                sslmode='require'  # Render требует SSL
+            )
+            log.info("✅ Пул соединений с БД создан")
+        except Exception as e:
+            log.error(f"❌ Ошибка создания пула: {e}")
+            sys.exit(1)
+
+    def get_conn(self):
+        """Получение соединения из пула"""
+        if not self.pool:
+            self.init_pool()
+        return self.pool.getconn()
+
+    def put_conn(self, conn):
+        """Возврат соединения в пул"""
+        if self.pool and conn:
+            self.pool.putconn(conn)
+
+    def execute(self, query: str, params: tuple = (), fetch_one: bool = False, fetch_all: bool = False):
+        """Универсальный метод выполнения запросов"""
+        conn = None
+        try:
+            conn = self.get_conn()
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(query, params)
+            
+            if fetch_one:
+                result = cur.fetchone()
+                return dict(result) if result else None
+            elif fetch_all:
+                results = cur.fetchall()
+                return [dict(r) for r in results]
+            else:
+                conn.commit()
+                return None
+                
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            log.error(f"❌ Ошибка БД: {e}")
+            raise
+        finally:
+            if conn:
+                self.put_conn(conn)
+
+    def init_tables(self):
+        """Создание всех необходимых таблиц"""
+        queries = [
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id              SERIAL PRIMARY KEY,
+                username        TEXT UNIQUE NOT NULL,
+                email           TEXT DEFAULT '',
+                password        TEXT NOT NULL,
+                bio             TEXT DEFAULT '',
+                avatar          TEXT DEFAULT '',
+                phone           TEXT DEFAULT '',
+                status          TEXT DEFAULT 'offline',
+                last_seen       BIGINT NOT NULL,
+                created_at      BIGINT NOT NULL,
+                messages_count  INTEGER DEFAULT 0,
+                friends_count   INTEGER DEFAULT 0
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                id              SERIAL PRIMARY KEY,
+                name            TEXT NOT NULL,
+                type            TEXT NOT NULL DEFAULT 'group',
+                description     TEXT DEFAULT '',
+                avatar          TEXT DEFAULT '',
+                created_by      INTEGER REFERENCES users(id),
+                created_at      BIGINT NOT NULL,
+                messages_count  INTEGER DEFAULT 0
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_members (
+                chat_id     INTEGER REFERENCES chats(id) ON DELETE CASCADE,
+                user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                role        TEXT NOT NULL DEFAULT 'member',
+                joined_at   BIGINT NOT NULL,
+                last_read   BIGINT DEFAULT 0,
+                PRIMARY KEY (chat_id, user_id)
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS messages (
+                id          SERIAL PRIMARY KEY,
+                chat_id     INTEGER REFERENCES chats(id) ON DELETE CASCADE,
+                user_id     INTEGER REFERENCES users(id),
+                username    TEXT NOT NULL,
+                text        TEXT NOT NULL,
+                type        TEXT DEFAULT 'text',
+                created_at  BIGINT NOT NULL,
+                edited_at   BIGINT,
+                reply_to    INTEGER,
+                deleted     BOOLEAN DEFAULT FALSE
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token       TEXT PRIMARY KEY,
+                user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                created_at  BIGINT NOT NULL,
+                expires_at  BIGINT NOT NULL
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS calls (
+                id          SERIAL PRIMARY KEY,
+                chat_id     INTEGER REFERENCES chats(id) ON DELETE CASCADE,
+                initiator   INTEGER REFERENCES users(id),
+                type        TEXT NOT NULL DEFAULT 'audio',
+                status      TEXT NOT NULL DEFAULT 'ringing',
+                started_at  BIGINT NOT NULL,
+                ended_at    BIGINT,
+                duration    INTEGER DEFAULT 0
+            );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS reactions (
+                message_id  INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+                user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                emoji       TEXT NOT NULL,
+                created_at  BIGINT NOT NULL,
+                PRIMARY KEY (message_id, user_id)
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_chat_time 
+            ON messages(chat_id, created_at DESC);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_users_status 
+            ON users(status);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_sessions_expires 
+            ON sessions(expires_at);
+            """
+        ]
+
+        try:
+            conn = self.get_conn()
+            cur = conn.cursor()
+            
+            for query in queries:
+                cur.execute(query)
+            
+            # Создаем общий чат, если его нет
+            cur.execute("SELECT id FROM chats WHERE id = 1")
             if not cur.fetchone():
-                cur.execute("INSERT INTO chats (name,type,created_at) VALUES ('Общий чат','group',%s)", (int(time.time()),))
-            c.commit()
-            log.info("PostgreSQL: БД готова")
+                cur.execute(
+                    "INSERT INTO chats (id, name, type, description, created_at) VALUES (1, 'Общий чат', 'group', 'Добро пожаловать!', %s)",
+                    (int(time.time()),)
+                )
+            
+            conn.commit()
+            log.info("✅ Таблицы созданы/проверены")
+            
         except Exception as e:
-            c.rollback(); log.error(f"Ошибка БД: {e}"); raise
+            log.error(f"❌ Ошибка инициализации БД: {e}")
+            raise
         finally:
-            self._release(c)
+            if conn:
+                self.put_conn(conn)
 
-    def _one(self, q, p=()):
-        c = self._conn()
-        try:
-            cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(q, p)
-            r = cur.fetchone()
-            return dict(r) if r else None
-        finally:
-            self._release(c)
+    def hash_password(self, password: str) -> str:
+        """Хеширование пароля"""
+        return hashlib.pbkdf2_hmac(
+            'sha256',
+            password.encode(),
+            SECRET_KEY.encode(),
+            100000
+        ).hex()
 
-    def _all(self, q, p=()):
-        c = self._conn()
-        try:
-            cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(q, p)
-            return [dict(r) for r in cur.fetchall()]
-        finally:
-            self._release(c)
-
-    def _run(self, q, p=(), ret=False):
-        c = self._conn()
-        try:
-            cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(q, p)
-            r = dict(cur.fetchone()) if ret else None
-            c.commit()
-            return r
-        except Exception as e:
-            c.rollback(); raise e
-        finally:
-            self._release(c)
-
-    def hash(self, pw):
-        return hashlib.pbkdf2_hmac('sha256', pw.encode(), SECRET_KEY.encode(), 100_000).hex()
-
-    # ── Пользователи ─────────────────────────────
-    def create_user(self, username, password, email=""):
+    # ==== Пользователи ====
+    def create_user(self, username: str, password: str, email: str = "") -> Optional[dict]:
+        """Создание нового пользователя"""
         now = int(time.time())
-        c = self._conn()
         try:
-            cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(
-                "INSERT INTO users (username,email,password,created_at,last_seen) VALUES (%s,%s,%s,%s,%s) RETURNING id,username,email",
-                (username, email, self.hash(password), now, now)
+            # Проверяем существование
+            existing = self.execute(
+                "SELECT id FROM users WHERE username = %s",
+                (username,),
+                fetch_one=True
             )
-            user = dict(cur.fetchone())
-            cur.execute(
-                "INSERT INTO chat_members (chat_id,user_id,role,joined_at) SELECT 1,%s,'member',%s WHERE EXISTS(SELECT 1 FROM chats WHERE id=1) ON CONFLICT DO NOTHING",
-                (user['id'], now)
-            )
-            c.commit()
+            if existing:
+                return None
+
+            # Создаем пользователя
+            user = self.execute("""
+                INSERT INTO users (username, email, password, last_seen, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, username, email, bio, avatar, phone, created_at
+            """, (username, email, self.hash_password(password), now, now), fetch_one=True)
+
+            # Добавляем в общий чат
+            self.execute("""
+                INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+                VALUES (1, %s, 'member', %s)
+                ON CONFLICT DO NOTHING
+            """, (user['id'], now))
+
+            log.info(f"✅ Новый пользователь: {username}")
             return user
-        except psycopg2.errors.UniqueViolation:
-            c.rollback(); return None
+
         except Exception as e:
-            c.rollback(); raise e
-        finally:
-            self._release(c)
+            log.error(f"❌ Ошибка создания пользователя: {e}")
+            return None
 
-    def verify_user(self, username, password):
-        return self._one(
-            "SELECT id,username,email,bio,avatar_url,phone,created_at FROM users WHERE username=%s AND password=%s",
-            (username, self.hash(password))
-        )
+    def verify_user(self, username: str, password: str) -> Optional[dict]:
+        """Проверка логина и пароля"""
+        return self.execute("""
+            SELECT id, username, email, bio, avatar, phone, created_at,
+                   messages_count, friends_count
+            FROM users
+            WHERE username = %s AND password = %s
+        """, (username, self.hash_password(password)), fetch_one=True)
 
-    def get_user(self, uid):
-        return self._one(
-            "SELECT id,username,email,bio,avatar_url,phone,status,last_seen,created_at FROM users WHERE id=%s",
-            (uid,)
-        )
+    def get_user(self, user_id: int) -> Optional[dict]:
+        """Получение пользователя по ID"""
+        return self.execute("""
+            SELECT id, username, email, bio, avatar, phone, status,
+                   last_seen, created_at, messages_count, friends_count
+            FROM users
+            WHERE id = %s
+        """, (user_id,), fetch_one=True)
 
-    def get_user_by_name(self, username):
-        return self._one(
-            "SELECT id,username,bio,avatar_url,status,last_seen,created_at FROM users WHERE username=%s",
-            (username,)
-        )
+    def get_user_by_username(self, username: str) -> Optional[dict]:
+        """Получение пользователя по имени"""
+        return self.execute("""
+            SELECT id, username, bio, avatar, status, last_seen
+            FROM users
+            WHERE username = %s
+        """, (username,), fetch_one=True)
 
-    def update_profile(self, uid, bio=None, avatar_url=None, phone=None, email=None):
-        fields, vals = [], []
-        if bio is not None:        fields.append("bio=%s");        vals.append(bio)
-        if avatar_url is not None: fields.append("avatar_url=%s"); vals.append(avatar_url)
-        if phone is not None:      fields.append("phone=%s");      vals.append(phone)
-        if email is not None:      fields.append("email=%s");      vals.append(email)
-        if not fields: return
-        vals.append(uid)
-        self._run(f"UPDATE users SET {','.join(fields)} WHERE id=%s", vals)
-
-    def change_password(self, uid, old_pw, new_pw):
-        user = self._one("SELECT password FROM users WHERE id=%s", (uid,))
-        if not user or user['password'] != self.hash(old_pw): return False
-        self._run("UPDATE users SET password=%s WHERE id=%s", (self.hash(new_pw), uid))
-        return True
-
-    def set_status(self, uid, status):
-        self._run("UPDATE users SET status=%s,last_seen=%s WHERE id=%s", (status, int(time.time()), uid))
-
-    # ── Сессии ───────────────────────────────────
-    def new_session(self, uid):
-        token = hashlib.sha256(f"{uid}{time.time()}{SECRET_KEY}".encode()).hexdigest()
-        now = int(time.time())
-        self._run("INSERT INTO sessions (token,user_id,created_at,expires_at) VALUES (%s,%s,%s,%s)",
-                  (token, uid, now, now + 86400*30))
-        return token
-
-    def check_session(self, token):
-        r = self._one("SELECT user_id FROM sessions WHERE token=%s AND expires_at>%s", (token, int(time.time())))
-        return r['user_id'] if r else None
-
-    def del_session(self, token):
-        self._run("DELETE FROM sessions WHERE token=%s", (token,))
-
-    # ── Чаты ─────────────────────────────────────
-    def user_chats(self, uid):
-        return self._all("""
-            SELECT c.id, c.name, c.type, c.description, c.avatar_url, cm.role,
-                (SELECT text FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_msg,
-                (SELECT created_at FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_ts,
-                (SELECT username FROM messages WHERE chat_id=c.id AND deleted=FALSE ORDER BY created_at DESC LIMIT 1) AS last_user
-            FROM chats c JOIN chat_members cm ON cm.chat_id=c.id
-            WHERE cm.user_id=%s
-            ORDER BY (SELECT COALESCE(MAX(created_at),0) FROM messages WHERE chat_id=c.id) DESC
-        """, (uid,))
-
-    def create_group(self, name, description, owner_id, member_ids):
-        now = int(time.time())
-        c = self._conn()
+    def update_profile(self, user_id: int, **kwargs) -> bool:
+        """Обновление профиля пользователя"""
+        allowed = ['bio', 'email', 'phone', 'avatar']
+        updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+        
+        if not updates:
+            return False
+        
+        set_clause = ', '.join([f"{k} = %s" for k in updates.keys()])
+        query = f"UPDATE users SET {set_clause} WHERE id = %s"
+        
         try:
-            cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute(
-                "INSERT INTO chats (name,type,description,created_by,owner_id,created_at) VALUES (%s,'group',%s,%s,%s,%s) RETURNING id,name,type,description,avatar_url",
-                (name, description, owner_id, owner_id, now)
-            )
-            chat = dict(cur.fetchone())
-            cur.execute("INSERT INTO chat_members (chat_id,user_id,role,joined_at) VALUES (%s,%s,'owner',%s)",
-                        (chat['id'], owner_id, now))
-            for mid in member_ids:
-                if mid != owner_id:
-                    cur.execute("INSERT INTO chat_members (chat_id,user_id,role,joined_at) VALUES (%s,%s,'member',%s) ON CONFLICT DO NOTHING",
-                                (chat['id'], mid, now))
-            c.commit()
-            return chat
-        except Exception as e:
-            c.rollback(); raise e
-        finally:
-            self._release(c)
-
-    def get_chat_members(self, chat_id):
-        return self._all("""
-            SELECT u.id, u.username, u.avatar_url, u.status, cm.role
-            FROM users u JOIN chat_members cm ON cm.user_id=u.id
-            WHERE cm.chat_id=%s ORDER BY cm.role DESC, u.username
-        """, (chat_id,))
-
-    def add_member(self, chat_id, user_id):
-        now = int(time.time())
-        self._run("INSERT INTO chat_members (chat_id,user_id,role,joined_at) VALUES (%s,%s,'member',%s) ON CONFLICT DO NOTHING",
-                  (chat_id, user_id, now))
-
-    def remove_member(self, chat_id, user_id):
-        self._run("DELETE FROM chat_members WHERE chat_id=%s AND user_id=%s", (chat_id, user_id))
-
-    def get_or_create_private(self, uid1, uid2, name2):
-        now = int(time.time())
-        c = self._conn()
-        try:
-            cur = c.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-            cur.execute("""
-                SELECT c.id,c.name FROM chats c
-                JOIN chat_members a ON a.chat_id=c.id AND a.user_id=%s
-                JOIN chat_members b ON b.chat_id=c.id AND b.user_id=%s
-                WHERE c.type='private' LIMIT 1
-            """, (uid1, uid2))
-            ex = cur.fetchone()
-            if ex: return dict(ex)
-            cur.execute("INSERT INTO chats (name,type,created_by,created_at) VALUES (%s,'private',%s,%s) RETURNING id,name",
-                        (name2, uid1, now))
-            chat = dict(cur.fetchone())
-            cur.execute("INSERT INTO chat_members (chat_id,user_id,role,joined_at) VALUES (%s,%s,'member',%s),(%s,%s,'member',%s)",
-                        (chat['id'],uid1,now, chat['id'],uid2,now))
-            c.commit()
-            return chat
-        except Exception as e:
-            c.rollback(); raise e
-        finally:
-            self._release(c)
-
-    # ── Сообщения ─────────────────────────────────
-    def save_msg(self, chat_id, uid, username, text, msg_type='text'):
-        return self._run(
-            "INSERT INTO messages (chat_id,user_id,username,text,type,created_at) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id,chat_id,user_id,username,text,type,created_at",
-            (chat_id, uid, username, text, msg_type, int(time.time())), ret=True
-        )
-
-    def get_msgs(self, chat_id, limit=50, before_id=None):
-        if before_id:
-            rows = self._all(
-                "SELECT id,user_id,username,text,type,created_at FROM messages WHERE chat_id=%s AND deleted=FALSE AND id<%s ORDER BY created_at DESC LIMIT %s",
-                (chat_id, before_id, limit))
-        else:
-            rows = self._all(
-                "SELECT id,user_id,username,text,type,created_at FROM messages WHERE chat_id=%s AND deleted=FALSE ORDER BY created_at DESC LIMIT %s",
-                (chat_id, limit))
-        return list(reversed(rows))
-
-    def add_reaction(self, message_id, user_id, emoji):
-        try:
-            self._run(
-                "INSERT INTO reactions (message_id,user_id,emoji,created_at) VALUES (%s,%s,%s,%s) ON CONFLICT (message_id,user_id) DO UPDATE SET emoji=%s",
-                (message_id, user_id, emoji, int(time.time()), emoji))
+            self.execute(query, list(updates.values()) + [user_id])
             return True
         except:
             return False
 
-    def get_reactions(self, message_id):
-        return self._all("SELECT emoji, COUNT(*) as count FROM reactions WHERE message_id=%s GROUP BY emoji", (message_id,))
+    def change_password(self, user_id: int, old_password: str, new_password: str) -> bool:
+        """Смена пароля"""
+        user = self.execute(
+            "SELECT password FROM users WHERE id = %s",
+            (user_id,),
+            fetch_one=True
+        )
+        
+        if not user or user['password'] != self.hash_password(old_password):
+            return False
+        
+        self.execute(
+            "UPDATE users SET password = %s WHERE id = %s",
+            (self.hash_password(new_password), user_id)
+        )
+        return True
 
-    def online_users(self):
-        return self._all("SELECT id,username,avatar_url FROM users WHERE status='online' ORDER BY username")
+    def set_status(self, user_id: int, status: str):
+        """Установка статуса пользователя"""
+        self.execute(
+            "UPDATE users SET status = %s, last_seen = %s WHERE id = %s",
+            (status, int(time.time()), user_id)
+        )
 
-    # ── Звонки ────────────────────────────────────
-    def create_call(self, chat_id, initiator, call_type='audio'):
-        return self._run(
-            "INSERT INTO calls (chat_id,initiator,type,status,started_at) VALUES (%s,%s,%s,'ringing',%s) RETURNING id",
-            (chat_id, initiator, call_type, int(time.time())), ret=True)
-
-    def end_call(self, call_id):
+    # ==== Сессии ====
+    def create_session(self, user_id: int) -> str:
+        """Создание сессии"""
+        token = hashlib.sha256(
+            f"{user_id}{time.time()}{SECRET_KEY}".encode()
+        ).hexdigest()
+        
         now = int(time.time())
-        c = self._conn()
+        self.execute("""
+            INSERT INTO sessions (token, user_id, created_at, expires_at)
+            VALUES (%s, %s, %s, %s)
+        """, (token, user_id, now, now + SESSION_TTL))
+        
+        return token
+
+    def check_session(self, token: str) -> Optional[int]:
+        """Проверка сессии"""
+        result = self.execute("""
+            SELECT user_id FROM sessions
+            WHERE token = %s AND expires_at > %s
+        """, (token, int(time.time())), fetch_one=True)
+        
+        return result['user_id'] if result else None
+
+    def delete_session(self, token: str):
+        """Удаление сессии"""
+        self.execute("DELETE FROM sessions WHERE token = %s", (token,))
+
+    # ==== Чаты ====
+    def get_user_chats(self, user_id: int) -> list:
+        """Получение всех чатов пользователя"""
+        return self.execute("""
+            SELECT 
+                c.id, c.name, c.type, c.description, c.avatar,
+                cm.role, cm.last_read,
+                (
+                    SELECT row_to_json(msg)
+                    FROM (
+                        SELECT m.text, m.username, m.created_at
+                        FROM messages m
+                        WHERE m.chat_id = c.id AND m.deleted = FALSE
+                        ORDER BY m.created_at DESC
+                        LIMIT 1
+                    ) msg
+                ) as last_message
+            FROM chats c
+            JOIN chat_members cm ON cm.chat_id = c.id
+            WHERE cm.user_id = %s
+            ORDER BY (
+                SELECT COALESCE(MAX(created_at), 0)
+                FROM messages
+                WHERE chat_id = c.id
+            ) DESC
+        """, (user_id,), fetch_all=True)
+
+    def create_group(self, name: str, description: str, creator_id: int, members: list) -> Optional[dict]:
+        """Создание группы"""
+        now = int(time.time())
         try:
-            cur = c.cursor()
-            cur.execute("SELECT started_at FROM calls WHERE id=%s", (call_id,))
-            row = cur.fetchone()
-            duration = (now - row[0]) if row else 0
-            cur.execute("UPDATE calls SET status='ended',ended_at=%s,duration=%s WHERE id=%s", (now, duration, call_id))
-            c.commit()
+            # Создаем чат
+            chat = self.execute("""
+                INSERT INTO chats (name, type, description, created_by, created_at)
+                VALUES (%s, 'group', %s, %s, %s)
+                RETURNING id, name, type, description, avatar, created_at
+            """, (name, description, creator_id, now), fetch_one=True)
+
+            # Добавляем создателя
+            self.execute("""
+                INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+                VALUES (%s, %s, 'owner', %s)
+            """, (chat['id'], creator_id, now))
+
+            # Добавляем остальных участников
+            for member_id in members:
+                if member_id != creator_id:
+                    self.execute("""
+                        INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+                        VALUES (%s, %s, 'member', %s)
+                        ON CONFLICT DO NOTHING
+                    """, (chat['id'], member_id, now))
+
+            log.info(f"✅ Группа создана: {name}")
+            return chat
+
         except Exception as e:
-            c.rollback()
-        finally:
-            self._release(c)
+            log.error(f"❌ Ошибка создания группы: {e}")
+            return None
+
+    def get_chat_info(self, chat_id: int) -> Optional[dict]:
+        """Получение информации о чате"""
+        return self.execute("""
+            SELECT id, name, type, description, avatar, created_by, created_at
+            FROM chats
+            WHERE id = %s
+        """, (chat_id,), fetch_one=True)
+
+    def get_chat_members(self, chat_id: int) -> list:
+        """Получение участников чата"""
+        return self.execute("""
+            SELECT u.id, u.username, u.avatar, u.status, cm.role, cm.joined_at
+            FROM users u
+            JOIN chat_members cm ON cm.user_id = u.id
+            WHERE cm.chat_id = %s
+            ORDER BY 
+                CASE cm.role 
+                    WHEN 'owner' THEN 1
+                    WHEN 'admin' THEN 2
+                    ELSE 3
+                END,
+                u.username
+        """, (chat_id,), fetch_all=True)
+
+    def add_member(self, chat_id: int, user_id: int):
+        """Добавление участника в чат"""
+        self.execute("""
+            INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+            VALUES (%s, %s, 'member', %s)
+            ON CONFLICT DO NOTHING
+        """, (chat_id, user_id, int(time.time())))
+
+    def remove_member(self, chat_id: int, user_id: int):
+        """Удаление участника из чата"""
+        self.execute("""
+            DELETE FROM chat_members
+            WHERE chat_id = %s AND user_id = %s
+        """, (chat_id, user_id))
+
+    def get_or_create_private(self, user1_id: int, user2_id: int, user2_name: str) -> dict:
+        """Получение или создание личного чата"""
+        now = int(time.time())
+        
+        # Ищем существующий чат
+        existing = self.execute("""
+            SELECT c.id, c.name, c.type
+            FROM chats c
+            JOIN chat_members m1 ON m1.chat_id = c.id
+            JOIN chat_members m2 ON m2.chat_id = c.id
+            WHERE c.type = 'private'
+                AND m1.user_id = %s
+                AND m2.user_id = %s
+            LIMIT 1
+        """, (user1_id, user2_id), fetch_one=True)
+        
+        if existing:
+            return existing
+        
+        # Создаем новый
+        chat = self.execute("""
+            INSERT INTO chats (name, type, created_by, created_at)
+            VALUES (%s, 'private', %s, %s)
+            RETURNING id, name, type
+        """, (user2_name, user1_id, now), fetch_one=True)
+
+        # Добавляем участников
+        self.execute("""
+            INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+            VALUES (%s, %s, 'member', %s), (%s, %s, 'member', %s)
+        """, (chat['id'], user1_id, now, chat['id'], user2_id, now))
+
+        return chat
+
+    # ==== Сообщения ====
+    def save_message(self, chat_id: int, user_id: int, username: str, text: str) -> dict:
+        """Сохранение сообщения"""
+        msg = self.execute("""
+            INSERT INTO messages (chat_id, user_id, username, text, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id, chat_id, user_id, username, text, created_at
+        """, (chat_id, user_id, username, text, int(time.time())), fetch_one=True)
+
+        # Обновляем счетчики
+        self.execute(
+            "UPDATE users SET messages_count = messages_count + 1 WHERE id = %s",
+            (user_id,)
+        )
+        self.execute(
+            "UPDATE chats SET messages_count = messages_count + 1 WHERE id = %s",
+            (chat_id,)
+        )
+
+        return msg
+
+    def get_messages(self, chat_id: int, limit: int = 50, before_id: int = None) -> list:
+        """Получение сообщений чата"""
+        if before_id:
+            return self.execute("""
+                SELECT m.*, 
+                       (
+                           SELECT json_object_agg(emoji, cnt)
+                           FROM (
+                               SELECT emoji, COUNT(*) as cnt
+                               FROM reactions
+                               WHERE message_id = m.id
+                               GROUP BY emoji
+                           ) r
+                       ) as reactions
+                FROM messages m
+                WHERE m.chat_id = %s 
+                    AND m.deleted = FALSE
+                    AND m.id < %s
+                ORDER BY m.created_at DESC
+                LIMIT %s
+            """, (chat_id, before_id, limit), fetch_all=True)
+        else:
+            msgs = self.execute("""
+                SELECT m.*, 
+                       (
+                           SELECT json_object_agg(emoji, cnt)
+                           FROM (
+                               SELECT emoji, COUNT(*) as cnt
+                               FROM reactions
+                               WHERE message_id = m.id
+                               GROUP BY emoji
+                           ) r
+                       ) as reactions
+                FROM messages m
+                WHERE m.chat_id = %s AND m.deleted = FALSE
+                ORDER BY m.created_at DESC
+                LIMIT %s
+            """, (chat_id, limit), fetch_all=True)
+        
+        return list(reversed(msgs)) if msgs else []
+
+    def add_reaction(self, message_id: int, user_id: int, emoji: str):
+        """Добавление реакции"""
+        self.execute("""
+            INSERT INTO reactions (message_id, user_id, emoji, created_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (message_id, user_id) 
+            DO UPDATE SET emoji = %s
+        """, (message_id, user_id, emoji, int(time.time()), emoji))
+
+    # ==== Звонки ====
+    def create_call(self, chat_id: int, initiator_id: int, call_type: str = 'audio') -> Optional[dict]:
+        """Создание звонка"""
+        return self.execute("""
+            INSERT INTO calls (chat_id, initiator, type, status, started_at)
+            VALUES (%s, %s, %s, 'ringing', %s)
+            RETURNING id, chat_id, type, status, started_at
+        """, (chat_id, initiator_id, call_type, int(time.time())), fetch_one=True)
+
+    def end_call(self, call_id: int):
+        """Завершение звонка"""
+        now = int(time.time())
+        call = self.execute(
+            "SELECT started_at FROM calls WHERE id = %s",
+            (call_id,),
+            fetch_one=True
+        )
+        
+        if call:
+            duration = now - call['started_at']
+            self.execute("""
+                UPDATE calls 
+                SET status = 'ended', ended_at = %s, duration = %s
+                WHERE id = %s
+            """, (now, duration, call_id))
+
+    def get_online_users(self) -> list:
+        """Получение списка онлайн пользователей"""
+        return self.execute("""
+            SELECT id, username, avatar, status
+            FROM users
+            WHERE status = 'online'
+            ORDER BY username
+        """, fetch_all=True)
 
 
-# ══════════════════════════════════════════════════
-# СЕРВЕР
-# ══════════════════════════════════════════════════
-if not DATABASE_URL:
-    log.error("DATABASE_URL не задан!"); exit(1)
-
-db = DB(DATABASE_URL)
-conns: Dict[int, dict] = {}
-active_calls: Dict[int, dict] = {}
-
-
-async def send(ws, data):
-    try:
-        await ws.send(json.dumps(data, ensure_ascii=False, default=str))
-    except:
-        pass
+class Connection:
+    """Информация о подключении клиента"""
+    def __init__(self, ws, user_id: int, username: str):
+        self.ws = ws
+        self.user_id = user_id
+        self.username = username
+        self.current_chat = 1
+        self.connected_at = time.time()
+        self.last_ping = time.time()
 
 
-async def broadcast(data, chat_id=None, skip=None):
-    msg = json.dumps(data, ensure_ascii=False, default=str)
-    if chat_id is None:
-        targets = [info["ws"] for uid, info in conns.items() if info["ws"] is not skip]
-    else:
-        members = db._all("SELECT user_id FROM chat_members WHERE chat_id=%s", (chat_id,))
-        member_ids = {m["user_id"] for m in members}
-        targets = [info["ws"] for uid, info in conns.items()
-                   if info["ws"] is not skip and uid in member_ids]
-    if targets:
-        await asyncio.gather(*[t.send(msg) for t in targets], return_exceptions=True)
+class TelegramWhiteServer:
+    """Основной класс сервера"""
+    
+    def __init__(self):
+        log.info("🚀 Инициализация TelegramWhite Server...")
+        self.db = Database(DATABASE_URL)
+        self.connections: Dict[int, Connection] = {}
+        self.active_calls: Dict[int, dict] = {}
+        log.info(f"✅ Сервер готов. Порт: {PORT}")
 
+    async def send(self, ws, data: dict):
+        """Отправка сообщения клиенту"""
+        try:
+            await ws.send(json.dumps(data, ensure_ascii=False))
+        except Exception as e:
+            log.debug(f"Ошибка отправки: {e}")
 
-async def push_online():
-    await broadcast({"type": "online_users", "users": db.online_users()})
+    async def broadcast(self, data: dict, chat_id: int = None, skip_user: int = None):
+        """Рассылка сообщения участникам чата"""
+        message = json.dumps(data, ensure_ascii=False)
+        
+        targets = []
+        if chat_id:
+            # Получаем участников чата
+            members = self.db.get_chat_members(chat_id)
+            member_ids = {m['id'] for m in members}
+            targets = [
+                conn.ws for uid, conn in self.connections.items()
+                if uid in member_ids and uid != skip_user
+            ]
+        else:
+            # Всем пользователям
+            targets = [
+                conn.ws for uid, conn in self.connections.items()
+                if uid != skip_user
+            ]
+        
+        if targets:
+            await asyncio.gather(
+                *[t.send(message) for t in targets],
+                return_exceptions=True
+            )
 
+    async def broadcast_online(self):
+        """Обновление списка онлайн пользователей"""
+        await self.broadcast({
+            'type': 'online_users',
+            'users': self.db.get_online_users()
+        })
 
-async def handler(ws):
-    uid = None
-    log.info(f"+ {ws.remote_address}")
-    try:
-        async for raw in ws:
-            try:
-                d = json.loads(raw)
-            except:
-                await send(ws, {"type": "error", "message": "Неверный JSON"}); continue
+    async def handle_message(self, ws, data: dict, user_id: int = None):
+        """Обработка входящих сообщений"""
+        msg_type = data.get('type')
+        
+        if not msg_type:
+            return
 
-            t = d.get("type", "")
+        # Ping/Pong для поддержания соединения
+        if msg_type == 'ping':
+            if user_id and user_id in self.connections:
+                self.connections[user_id].last_ping = time.time()
+            await self.send(ws, {'type': 'pong'})
+            return
 
-            if t == "ping":
-                await send(ws, {"type": "pong"}); continue
+        # === Регистрация ===
+        if msg_type == 'register':
+            username = data.get('username', '').strip()
+            password = data.get('password', '')
+            email = data.get('email', '').strip()
+            
+            if len(username) < 3:
+                await self.send(ws, {'type': 'error', 'message': 'Имя должно содержать минимум 3 символа'})
+                return
+            if len(password) < 6:
+                await self.send(ws, {'type': 'error', 'message': 'Пароль должен содержать минимум 6 символов'})
+                return
+            
+            user = self.db.create_user(username, password, email)
+            if not user:
+                await self.send(ws, {'type': 'error', 'message': 'Имя пользователя уже занято'})
+                return
+            
+            token = self.db.create_session(user['id'])
+            await self.send(ws, {
+                'type': 'registered',
+                'user': user,
+                'token': token
+            })
+            log.info(f"✅ Регистрация: {username}")
+            return
 
-            if t == "register":
-                u = d.get("username","").strip(); p = d.get("password",""); e = d.get("email","").strip()
-                if len(u) < 3: await send(ws, {"type":"error","message":"Имя: минимум 3 символа"}); continue
-                if len(p) < 6: await send(ws, {"type":"error","message":"Пароль: минимум 6 символов"}); continue
-                user = db.create_user(u, p, e)
-                if not user: await send(ws, {"type":"error","message":"Имя уже занято"}); continue
-                token = db.new_session(user["id"])
-                log.info(f"Регистрация: {u}")
-                await send(ws, {"type":"registered","user":user,"token":token})
-                continue
+        # === Вход ===
+        if msg_type == 'login':
+            username = data.get('username', '').strip()
+            password = data.get('password', '')
+            
+            user = self.db.verify_user(username, password)
+            if not user:
+                await self.send(ws, {'type': 'error', 'message': 'Неверный логин или пароль'})
+                return
+            
+            # Обновляем статус
+            self.db.set_status(user['id'], 'online')
+            
+            # Создаем сессию
+            token = self.db.create_session(user['id'])
+            
+            # Сохраняем соединение
+            self.connections[user['id']] = Connection(ws, user['id'], username)
+            
+            # Отправляем данные
+            chats = self.db.get_user_chats(user['id'])
+            await self.send(ws, {
+                'type': 'logged_in',
+                'user': user,
+                'token': token,
+                'chats': chats
+            })
+            
+            # Отправляем историю общего чата
+            await self.send(ws, {
+                'type': 'history',
+                'chat_id': 1,
+                'messages': self.db.get_messages(1)
+            })
+            
+            # Оповещаем всех
+            await self.broadcast_online()
+            await self.broadcast({
+                'type': 'system',
+                'chat_id': 1,
+                'text': f'👋 {username} присоединился'
+            }, chat_id=1, skip_user=user['id'])
+            
+            log.info(f"✅ Вход: {username}")
+            return
 
-            if t == "login":
-                u = d.get("username","").strip(); p = d.get("password","")
-                user = db.verify_user(u, p)
-                if not user: await send(ws, {"type":"error","message":"Неверный логин или пароль"}); continue
-                token = db.new_session(user["id"])
-                db.set_status(user["id"], "online")
-                uid = user["id"]
-                conns[uid] = {"ws":ws,"username":user["username"],"current_chat":1,"avatar_url":user.get("avatar_url","")}
-                await send(ws, {"type":"logged_in","user":user,"token":token,"chats":db.user_chats(uid)})
-                await send(ws, {"type":"history","chat_id":1,"messages":db.get_msgs(1)})
-                await push_online()
-                await broadcast({"type":"system","chat_id":1,"text":f"👋 {u} вошёл"}, chat_id=1, skip=ws)
-                log.info(f"Вход: {u}")
-                continue
+        # === Восстановление сессии ===
+        if msg_type == 'session':
+            token = data.get('token', '')
+            user_id = self.db.check_session(token)
+            
+            if not user_id:
+                await self.send(ws, {'type': 'error', 'message': 'Сессия истекла'})
+                return
+            
+            user = self.db.get_user(user_id)
+            if not user:
+                await self.send(ws, {'type': 'error', 'message': 'Пользователь не найден'})
+                return
+            
+            # Обновляем статус
+            self.db.set_status(user_id, 'online')
+            self.connections[user_id] = Connection(ws, user_id, user['username'])
+            
+            chats = self.db.get_user_chats(user_id)
+            await self.send(ws, {
+                'type': 'session_ok',
+                'user': user,
+                'chats': chats
+            })
+            
+            await self.send(ws, {
+                'type': 'history',
+                'chat_id': 1,
+                'messages': self.db.get_messages(1)
+            })
+            
+            await self.broadcast_online()
+            log.info(f"✅ Восстановлена сессия: {user['username']}")
+            return
 
-            if t == "session":
-                token = d.get("token","")
-                user_id = db.check_session(token)
-                if not user_id: await send(ws, {"type":"error","message":"Сессия истекла"}); continue
-                user = db.get_user(user_id)
-                if not user: await send(ws, {"type":"error","message":"Пользователь не найден"}); continue
-                db.set_status(user_id, "online")
-                uid = user_id
-                conns[uid] = {"ws":ws,"username":user["username"],"current_chat":1,"avatar_url":user.get("avatar_url","")}
-                await send(ws, {"type":"session_ok","user":user,"chats":db.user_chats(uid)})
-                await send(ws, {"type":"history","chat_id":1,"messages":db.get_msgs(1)})
-                await push_online()
-                continue
+        # === Проверка авторизации для остальных методов ===
+        if not user_id or user_id not in self.connections:
+            await self.send(ws, {'type': 'error', 'message': 'Требуется авторизация'})
+            return
 
-            if not uid or uid not in conns:
-                await send(ws, {"type":"error","message":"Необходима авторизация"}); continue
+        conn = self.connections[user_id]
 
-            # ── Сообщения ────────────────────────
-            if t == "send_message":
-                chat_id = d.get("chat_id",1); text = d.get("text","").strip()
-                if not text or len(text) > 4096: await send(ws, {"type":"error","message":"Пустое сообщение"}); continue
-                msg = db.save_msg(chat_id, uid, conns[uid]["username"], text)
-                await broadcast({"type":"message","message":msg}, chat_id=chat_id)
+        # === Отправка сообщения ===
+        if msg_type == 'send_message':
+            chat_id = data.get('chat_id', 1)
+            text = data.get('text', '').strip()
+            
+            if not text or len(text) > MAX_MESSAGE_LENGTH:
+                await self.send(ws, {'type': 'error', 'message': 'Некорректное сообщение'})
+                return
+            
+            msg = self.db.save_message(chat_id, user_id, conn.username, text)
+            await self.broadcast({'type': 'message', 'message': msg}, chat_id=chat_id)
+            return
 
-            elif t == "get_history":
-                chat_id = d.get("chat_id",1)
-                await send(ws, {"type":"history","chat_id":chat_id,"messages":db.get_msgs(chat_id, before_id=d.get("before_id"))})
+        # === Получение истории ===
+        if msg_type == 'get_history':
+            chat_id = data.get('chat_id', 1)
+            before_id = data.get('before_id')
+            messages = self.db.get_messages(chat_id, before_id=before_id)
+            # Переворачиваем для правильного порядка
+            await self.send(ws, {
+                'type': 'history',
+                'chat_id': chat_id,
+                'messages': messages
+            })
+            return
 
-            elif t == "switch_chat":
-                chat_id = d.get("chat_id",1)
-                conns[uid]["current_chat"] = chat_id
-                await send(ws, {"type":"history","chat_id":chat_id,"messages":db.get_msgs(chat_id)})
+        # === Смена чата ===
+        if msg_type == 'switch_chat':
+            chat_id = data.get('chat_id', 1)
+            conn.current_chat = chat_id
+            messages = self.db.get_messages(chat_id)
+            await self.send(ws, {
+                'type': 'history',
+                'chat_id': chat_id,
+                'messages': messages
+            })
+            return
 
-            elif t == "typing":
-                chat_id = d.get("chat_id",1)
-                await broadcast({"type":"typing","username":conns[uid]["username"],"chat_id":chat_id}, chat_id=chat_id, skip=ws)
+        # === Печатает... ===
+        if msg_type == 'typing':
+            chat_id = data.get('chat_id', 1)
+            await self.broadcast({
+                'type': 'typing',
+                'username': conn.username,
+                'chat_id': chat_id
+            }, chat_id=chat_id, skip_user=user_id)
+            return
 
-            # ── Профиль ──────────────────────────
-            elif t == "get_profile":
-                target = d.get("username")
-                u = db.get_user_by_name(target) if target else db.get_user(uid)
-                if not u: await send(ws, {"type":"error","message":"Пользователь не найден"}); continue
-                await send(ws, {"type":"profile","user":u})
+        # === Реакции ===
+        if msg_type == 'react':
+            message_id = data.get('message_id')
+            emoji = data.get('emoji')
+            chat_id = data.get('chat_id', 1)
+            
+            if message_id and emoji:
+                self.db.add_reaction(message_id, user_id, emoji)
+            return
 
-            elif t == "update_profile":
-                bio = d.get("bio"); phone = d.get("phone"); email = d.get("email")
-                avatar_b64 = d.get("avatar"); avatar_url = None
-                if avatar_b64:
-                    if len(avatar_b64) > MAX_AVATAR * 1.4:
-                        await send(ws, {"type":"error","message":"Аватар слишком большой (макс 2MB)"}); continue
-                    avatar_url = avatar_b64
-                db.update_profile(uid, bio=bio, avatar_url=avatar_url, phone=phone, email=email)
-                if avatar_url: conns[uid]["avatar_url"] = avatar_url
-                user = db.get_user(uid)
-                await send(ws, {"type":"profile_updated","user":user})
-                await push_online()
+        # === Получение профиля ===
+        if msg_type == 'get_profile':
+            target = data.get('username')
+            if target:
+                profile = self.db.get_user_by_username(target)
+            else:
+                profile = self.db.get_user(user_id)
+            
+            if not profile:
+                await self.send(ws, {'type': 'error', 'message': 'Пользователь не найден'})
+                return
+            
+            await self.send(ws, {'type': 'profile', 'user': profile})
+            return
 
-            elif t == "change_password":
-                old_pw = d.get("old_password",""); new_pw = d.get("new_password","")
-                if len(new_pw) < 6: await send(ws, {"type":"error","message":"Минимум 6 символов"}); continue
-                if db.change_password(uid, old_pw, new_pw):
-                    await send(ws, {"type":"password_changed"})
-                else:
-                    await send(ws, {"type":"error","message":"Неверный текущий пароль"})
+        # === Обновление профиля ===
+        if msg_type == 'update_profile':
+            bio = data.get('bio')
+            email = data.get('email')
+            phone = data.get('phone')
+            avatar = data.get('avatar')
+            
+            self.db.update_profile(
+                user_id,
+                bio=bio,
+                email=email,
+                phone=phone,
+                avatar=avatar
+            )
+            
+            user = self.db.get_user(user_id)
+            await self.send(ws, {'type': 'profile_updated', 'user': user})
+            return
 
-            # ── Группы ───────────────────────────
-            elif t == "create_group":
-                name = d.get("name","").strip(); description = d.get("description","").strip()
-                member_names = d.get("members",[])
-                if not name: await send(ws, {"type":"error","message":"Введите название группы"}); continue
-                member_ids = [uid]
-                for uname in member_names:
-                    u = db._one("SELECT id FROM users WHERE username=%s", (uname,))
-                    if u: member_ids.append(u["id"])
-                chat = db.create_group(name, description, uid, member_ids)
-                members = db.get_chat_members(chat["id"])
-                for m in members:
-                    if m["id"] in conns and m["id"] != uid:
-                        await send(conns[m["id"]]["ws"], {"type":"new_group_chat","chat":{**chat,"type":"group"}})
-                await send(ws, {"type":"group_created","chat":{**chat,"type":"group"},"members":members})
-                log.info(f"Группа: {name}")
+        # === Смена пароля ===
+        if msg_type == 'change_password':
+            old_pass = data.get('old_password', '')
+            new_pass = data.get('new_password', '')
+            
+            if len(new_pass) < 6:
+                await self.send(ws, {'type': 'error', 'message': 'Минимальная длина пароля 6 символов'})
+                return
+            
+            if self.db.change_password(user_id, old_pass, new_pass):
+                await self.send(ws, {'type': 'password_changed'})
+            else:
+                await self.send(ws, {'type': 'error', 'message': 'Неверный текущий пароль'})
+            return
 
-            elif t == "get_chat_info":
-                chat_id = d.get("chat_id")
-                chat = db._one("SELECT id,name,type,description,avatar_url,owner_id FROM chats WHERE id=%s", (chat_id,))
-                members = db.get_chat_members(chat_id)
-                await send(ws, {"type":"chat_info","chat":chat,"members":members})
-
-            elif t == "add_member":
-                chat_id = d.get("chat_id"); username = d.get("username","").strip()
-                target = db._one("SELECT id FROM users WHERE username=%s", (username,))
-                if not target: await send(ws, {"type":"error","message":"Пользователь не найден"}); continue
-                db.add_member(chat_id, target["id"])
-                chat_name = db._one("SELECT name FROM chats WHERE id=%s", (chat_id,))["name"]
-                if target["id"] in conns:
-                    await send(conns[target["id"]]["ws"], {"type":"added_to_chat","chat":{"id":chat_id,"name":chat_name,"type":"group"}})
-                await broadcast({"type":"system","chat_id":chat_id,"text":f"➕ {username} добавлен"}, chat_id=chat_id)
-
-            elif t == "leave_chat":
-                chat_id = d.get("chat_id"); uname = conns[uid]["username"]
-                db.remove_member(chat_id, uid)
-                await broadcast({"type":"system","chat_id":chat_id,"text":f"👋 {uname} покинул чат"}, chat_id=chat_id)
-                await send(ws, {"type":"left_chat","chat_id":chat_id})
-
-            # ── Личные чаты ──────────────────────
-            elif t == "start_private":
-                target_name = d.get("username","").strip()
-                target = db._one("SELECT id FROM users WHERE username=%s", (target_name,))
-                if not target: await send(ws, {"type":"error","message":"Пользователь не найден"}); continue
-                chat = db.get_or_create_private(uid, target['id'], target_name)
-                msgs = db.get_msgs(chat['id'])
-                await send(ws, {"type":"private_chat_created","chat":{"id":chat["id"],"name":target_name,"type":"private"},"messages":msgs})
-                if target['id'] in conns:
-                    await send(conns[target['id']]["ws"], {
-                        "type":"new_private_chat",
-                        "chat":{"id":chat["id"],"name":conns[uid]["username"],"type":"private"},
-                        "messages":db.get_msgs(chat["id"])
+        # === Создание группы ===
+        if msg_type == 'create_group':
+            name = data.get('name', '').strip()
+            description = data.get('description', '').strip()
+            members = data.get('members', [])
+            
+            if not name:
+                await self.send(ws, {'type': 'error', 'message': 'Введите название группы'})
+                return
+            
+            # Получаем ID участников
+            member_ids = [user_id]
+            for username in members:
+                user = self.db.get_user_by_username(username)
+                if user:
+                    member_ids.append(user['id'])
+            
+            chat = self.db.create_group(name, description, user_id, member_ids)
+            if not chat:
+                await self.send(ws, {'type': 'error', 'message': 'Ошибка создания группы'})
+                return
+            
+            # Оповещаем участников
+            members_info = self.db.get_chat_members(chat['id'])
+            for member in members_info:
+                if member['id'] in self.connections and member['id'] != user_id:
+                    await self.send(self.connections[member['id']].ws, {
+                        'type': 'new_group_chat',
+                        'chat': {**chat, 'type': 'group'}
                     })
+            
+            await self.send(ws, {
+                'type': 'group_created',
+                'chat': {**chat, 'type': 'group'},
+                'members': members_info
+            })
+            
+            log.info(f"✅ Группа создана: {name}")
+            return
 
-            # ── Реакции ──────────────────────────
-            elif t == "react":
-                msg_id = d.get("message_id"); emoji = d.get("emoji",""); chat_id = d.get("chat_id",1)
-                if msg_id and emoji:
-                    db.add_reaction(msg_id, uid, emoji)
-                    await broadcast({"type":"reactions_updated","message_id":msg_id,"reactions":db.get_reactions(msg_id)}, chat_id=chat_id)
+        # === Информация о чате ===
+        if msg_type == 'get_chat_info':
+            chat_id = data.get('chat_id')
+            chat = self.db.get_chat_info(chat_id)
+            members = self.db.get_chat_members(chat_id)
+            
+            await self.send(ws, {
+                'type': 'chat_info',
+                'chat': chat,
+                'members': members
+            })
+            return
 
-            # ── Звонки ───────────────────────────
-            elif t == "call_start":
-                chat_id = d.get("chat_id"); call_type = d.get("call_type","audio")
-                call = db.create_call(chat_id, uid, call_type)
-                call_id = call["id"]
-                active_calls[call_id] = {"chat_id":chat_id,"type":call_type,"initiator":uid,"participants":{uid}}
-                await broadcast({"type":"incoming_call","call_id":call_id,"chat_id":chat_id,"call_type":call_type,
-                                 "from":conns[uid]["username"],"from_id":uid,"avatar":conns[uid].get("avatar_url","")},
-                                chat_id=chat_id, skip=ws)
-                await send(ws, {"type":"call_started","call_id":call_id,"call_type":call_type})
+        # === Добавление участника ===
+        if msg_type == 'add_member':
+            chat_id = data.get('chat_id')
+            username = data.get('username', '').strip()
+            
+            target = self.db.get_user_by_username(username)
+            if not target:
+                await self.send(ws, {'type': 'error', 'message': 'Пользователь не найден'})
+                return
+            
+            self.db.add_member(chat_id, target['id'])
+            
+            # Оповещаем нового участника
+            if target['id'] in self.connections:
+                chat = self.db.get_chat_info(chat_id)
+                await self.send(self.connections[target['id']].ws, {
+                    'type': 'added_to_chat',
+                    'chat': {**chat, 'type': 'group'}
+                })
+            
+            await self.broadcast({
+                'type': 'system',
+                'chat_id': chat_id,
+                'text': f'➕ {username} присоединился к группе'
+            }, chat_id=chat_id)
+            return
 
-            elif t == "call_accept":
-                call_id = d.get("call_id")
-                if call_id not in active_calls: continue
-                active_calls[call_id]["participants"].add(uid)
-                iid = active_calls[call_id]["initiator"]
-                if iid in conns:
-                    await send(conns[iid]["ws"], {"type":"call_accepted","call_id":call_id,"by":conns[uid]["username"],"by_id":uid})
-                await send(ws, {"type":"call_joined","call_id":call_id})
+        # === Выход из группы ===
+        if msg_type == 'leave_chat':
+            chat_id = data.get('chat_id')
+            username = conn.username
+            
+            self.db.remove_member(chat_id, user_id)
+            
+            await self.broadcast({
+                'type': 'system',
+                'chat_id': chat_id,
+                'text': f'👋 {username} покинул группу'
+            }, chat_id=chat_id)
+            
+            await self.send(ws, {'type': 'left_chat', 'chat_id': chat_id})
+            return
 
-            elif t == "call_decline":
-                call_id = d.get("call_id")
-                if call_id not in active_calls: continue
-                iid = active_calls[call_id]["initiator"]
-                if iid in conns:
-                    await send(conns[iid]["ws"], {"type":"call_declined","call_id":call_id,"by":conns[uid]["username"]})
+        # === Личный чат ===
+        if msg_type == 'start_private':
+            target_name = data.get('username', '').strip()
+            target = self.db.get_user_by_username(target_name)
+            
+            if not target:
+                await self.send(ws, {'type': 'error', 'message': 'Пользователь не найден'})
+                return
+            
+            chat = self.db.get_or_create_private(user_id, target['id'], target_name)
+            messages = self.db.get_messages(chat['id'])
+            
+            await self.send(ws, {
+                'type': 'private_chat_created',
+                'chat': {
+                    'id': chat['id'],
+                    'name': target_name,
+                    'type': 'private'
+                },
+                'messages': messages
+            })
+            
+            # Оповещаем собеседника
+            if target['id'] in self.connections:
+                await self.send(self.connections[target['id']].ws, {
+                    'type': 'new_private_chat',
+                    'chat': {
+                        'id': chat['id'],
+                        'name': conn.username,
+                        'type': 'private'
+                    },
+                    'messages': messages
+                })
+            
+            log.info(f"💬 Личный чат: {conn.username} - {target_name}")
+            return
 
-            elif t == "call_end":
-                call_id = d.get("call_id")
-                if call_id in active_calls:
-                    chat_id = active_calls[call_id]["chat_id"]
-                    db.end_call(call_id)
-                    await broadcast({"type":"call_ended","call_id":call_id}, chat_id=chat_id)
-                    del active_calls[call_id]
+        # === Звонки ===
+        if msg_type == 'call_start':
+            chat_id = data.get('chat_id')
+            call_type = data.get('call_type', 'audio')
+            
+            call = self.db.create_call(chat_id, user_id, call_type)
+            if not call:
+                await self.send(ws, {'type': 'error', 'message': 'Не удалось начать звонок'})
+                return
+            
+            self.active_calls[call['id']] = {
+                'chat_id': chat_id,
+                'type': call_type,
+                'initiator': user_id,
+                'participants': {user_id}
+            }
+            
+            # Оповещаем всех в чате
+            await self.broadcast({
+                'type': 'incoming_call',
+                'call_id': call['id'],
+                'chat_id': chat_id,
+                'call_type': call_type,
+                'from': conn.username,
+                'from_id': user_id,
+                'avatar': None
+            }, chat_id=chat_id, skip_user=user_id)
+            
+            await self.send(ws, {
+                'type': 'call_started',
+                'call_id': call['id'],
+                'call_type': call_type
+            })
+            
+            log.info(f"📞 Звонок начат: {call_type} в чате {chat_id}")
+            return
 
-            # ── WebRTC сигналы ───────────────────
-            elif t == "webrtc_offer":
-                tid = d.get("target_id")
-                if tid in conns:
-                    await send(conns[tid]["ws"], {"type":"webrtc_offer","call_id":d.get("call_id"),"offer":d.get("offer"),"from_id":uid})
+        if msg_type == 'call_accept':
+            call_id = data.get('call_id')
+            if call_id not in self.active_calls:
+                return
+            
+            call = self.active_calls[call_id]
+            call['participants'].add(user_id)
+            
+            # Оповещаем инициатора
+            initiator_id = call['initiator']
+            if initiator_id in self.connections:
+                await self.send(self.connections[initiator_id].ws, {
+                    'type': 'call_accepted',
+                    'call_id': call_id,
+                    'by': conn.username,
+                    'by_id': user_id
+                })
+            
+            await self.send(ws, {'type': 'call_joined', 'call_id': call_id})
+            return
 
-            elif t == "webrtc_answer":
-                tid = d.get("target_id")
-                if tid in conns:
-                    await send(conns[tid]["ws"], {"type":"webrtc_answer","call_id":d.get("call_id"),"answer":d.get("answer"),"from_id":uid})
+        if msg_type == 'call_decline':
+            call_id = data.get('call_id')
+            if call_id not in self.active_calls:
+                return
+            
+            call = self.active_calls[call_id]
+            initiator_id = call['initiator']
+            
+            if initiator_id in self.connections:
+                await self.send(self.connections[initiator_id].ws, {
+                    'type': 'call_declined',
+                    'call_id': call_id,
+                    'by': conn.username
+                })
+            return
 
-            elif t == "webrtc_ice":
-                tid = d.get("target_id")
-                if tid in conns:
-                    await send(conns[tid]["ws"], {"type":"webrtc_ice","call_id":d.get("call_id"),"candidate":d.get("candidate"),"from_id":uid})
+        if msg_type == 'call_end':
+            call_id = data.get('call_id')
+            if call_id in self.active_calls:
+                call = self.active_calls[call_id]
+                self.db.end_call(call_id)
+                
+                await self.broadcast({
+                    'type': 'call_ended',
+                    'call_id': call_id
+                }, chat_id=call['chat_id'])
+                
+                del self.active_calls[call_id]
+            return
 
-            # ── Выход ────────────────────────────
-            elif t == "logout":
-                db.del_session(d.get("token",""))
-                db.set_status(uid, "offline")
-                uname = conns.pop(uid, {}).get("username","")
-                uid = None
-                await broadcast({"type":"system","chat_id":1,"text":f"🔴 {uname} вышел"}, chat_id=1)
-                await push_online()
-                await send(ws, {"type":"logged_out"})
+        # === WebRTC сигнализация ===
+        if msg_type in ['webrtc_offer', 'webrtc_answer', 'webrtc_ice']:
+            target_id = data.get('target_id')
+            if target_id in self.connections:
+                await self.send(self.connections[target_id].ws, {
+                    'type': msg_type,
+                    'call_id': data.get('call_id'),
+                    'offer' if msg_type == 'webrtc_offer' else 
+                    'answer' if msg_type == 'webrtc_answer' else 
+                    'candidate': data.get('offer' if msg_type == 'webrtc_offer' else 
+                                         'answer' if msg_type == 'webrtc_answer' else 
+                                         'candidate'),
+                    'from_id': user_id
+                })
+            return
 
-            elif t == "get_online":
-                await send(ws, {"type":"online_users","users":db.online_users()})
+        # === Выход ===
+        if msg_type == 'logout':
+            token = data.get('token', '')
+            if token:
+                self.db.delete_session(token)
+            
+            if user_id in self.connections:
+                username = self.connections[user_id].username
+                del self.connections[user_id]
+                
+                self.db.set_status(user_id, 'offline')
+                
+                await self.broadcast({
+                    'type': 'system',
+                    'chat_id': 1,
+                    'text': f'🔴 {username} вышел'
+                }, chat_id=1)
+                
+                await self.broadcast_online()
+            
+            await self.send(ws, {'type': 'logged_out'})
+            log.info(f"👋 Выход: user_id={user_id}")
+            return
 
-    except websockets.exceptions.ConnectionClosed:
-        pass
-    except Exception as e:
-        log.error(f"Ошибка: {e}", exc_info=True)
-    finally:
-        if uid and uid in conns:
-            uname = conns.pop(uid, {}).get("username","")
-            db.set_status(uid, "offline")
-            for cid, call in list(active_calls.items()):
-                if call["initiator"] == uid:
-                    db.end_call(cid)
-                    await broadcast({"type":"call_ended","call_id":cid}, chat_id=call["chat_id"])
-                    del active_calls[cid]
-            await broadcast({"type":"system","chat_id":1,"text":f"🔴 {uname} отключился"}, chat_id=1)
-            await push_online()
-        log.info(f"- {ws.remote_address}")
+        # === Получение списка онлайн ===
+        if msg_type == 'get_online':
+            await self.send(ws, {
+                'type': 'online_users',
+                'users': self.db.get_online_users()
+            })
+            return
+
+    async def handler(self, ws, path):
+        """Основной обработчик WebSocket соединений"""
+        client_info = f"{ws.remote_address[0]}:{ws.remote_address[1]}"
+        log.info(f"➕ Новое подключение: {client_info}")
+        
+        user_id = None
+        try:
+            async for message in ws:
+                try:
+                    data = json.loads(message)
+                    await self.handle_message(ws, data, user_id)
+                    
+                    # Если это логин или сессия, сохраняем user_id
+                    if data.get('type') in ['login', 'session'] and 'user_id' in data:
+                        user_id = data['user_id']
+                        
+                except json.JSONDecodeError:
+                    await self.send(ws, {'type': 'error', 'message': 'Неверный JSON'})
+                except Exception as e:
+                    log.error(f"❌ Ошибка обработки: {e}", exc_info=True)
+                    await self.send(ws, {'type': 'error', 'message': 'Внутренняя ошибка сервера'})
+        
+        except websockets.exceptions.ConnectionClosed:
+            log.debug(f"📴 Соединение закрыто: {client_info}")
+        except Exception as e:
+            log.error(f"❌ Ошибка соединения: {e}")
+        finally:
+            # Очистка при отключении
+            if user_id and user_id in self.connections:
+                username = self.connections[user_id].username
+                
+                # Завершаем активные звонки
+                for call_id, call in list(self.active_calls.items()):
+                    if user_id in call['participants']:
+                        self.db.end_call(call_id)
+                        await self.broadcast({
+                            'type': 'call_ended',
+                            'call_id': call_id
+                        }, chat_id=call['chat_id'])
+                        del self.active_calls[call_id]
+                
+                del self.connections[user_id]
+                self.db.set_status(user_id, 'offline')
+                
+                # Оповещаем всех
+                await self.broadcast({
+                    'type': 'system',
+                    'chat_id': 1,
+                    'text': f'🔴 {username} отключился'
+                }, chat_id=1)
+                await self.broadcast_online()
+                
+                log.info(f"➖ Отключение: {username}")
+            else:
+                log.info(f"➖ Отключение (без авторизации): {client_info}")
+
+    async def ping_checker(self):
+        """Проверка активности соединений"""
+        while True:
+            await asyncio.sleep(30)
+            now = time.time()
+            for user_id, conn in list(self.connections.items()):
+                if now - conn.last_ping > PING_TIMEOUT * 3:
+                    log.warning(f"⚠️ Таймаут ping для user_id={user_id}")
+                    try:
+                        await conn.ws.close()
+                    except:
+                        pass
+
+    async def cleanup_old_sessions(self):
+        """Очистка старых сессий (раз в час)"""
+        while True:
+            await asyncio.sleep(3600)  # Каждый час
+            try:
+                self.db.execute(
+                    "DELETE FROM sessions WHERE expires_at < %s",
+                    (int(time.time()),)
+                )
+                log.info("🧹 Очистка старых сессий выполнена")
+            except Exception as e:
+                log.error(f"❌ Ошибка очистки сессий: {e}")
+
+    async def run(self):
+        """Запуск сервера"""
+        log.info(f"🚀 Запуск сервера на {HOST}:{PORT}")
+        
+        async with websockets.serve(
+            self.handler,
+            HOST,
+            PORT,
+            ping_interval=PING_INTERVAL,
+            ping_timeout=PING_TIMEOUT,
+            max_size=10 * 1024 * 1024  # 10MB макс размер сообщения
+        ):
+            log.info(f"✅ Сервер запущен и слушает порт {PORT}")
+            
+            # Запускаем фоновые задачи
+            asyncio.create_task(self.ping_checker())
+            asyncio.create_task(self.cleanup_old_sessions())
+            
+            # Бесконечное ожидание
+            await asyncio.Future()
 
 
-async def main():
-    log.info(f"🚀 Сервер на {HOST}:{PORT}")
-    async with websockets.serve(handler, HOST, PORT, ping_interval=30, ping_timeout=10):
-        log.info("✅ Готов!")
-        await asyncio.Future()
+# ============================================
+# Запуск
+# ============================================
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    log.info("=" * 50)
+    log.info("TelegramWhite Server for Render")
+    log.info("=" * 50)
+    log.info(f"Порт: {PORT}")
+    log.info(f"БД: {'задана' if DATABASE_URL else 'НЕ ЗАДАНА!'}")
+    
+    if not DATABASE_URL:
+        log.error("❌ КРИТИЧЕСКАЯ ОШИБКА: DATABASE_URL не задан!")
+        log.error("Добавьте переменную окружения DATABASE_URL в настройках Render")
+        sys.exit(1)
+    
+    server = TelegramWhiteServer()
+    
+    try:
+        asyncio.run(server.run())
+    except KeyboardInterrupt:
+        log.info("👋 Сервер остановлен")
+    except Exception as e:
+        log.error(f"❌ Критическая ошибка: {e}", exc_info=True)
+        sys.exit(1)
