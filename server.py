@@ -794,11 +794,13 @@ class TelegramWhiteServer:
                 'chats': chats
             })
             
-            await self.send(ws, {
-                'type': 'history',
-                'chat_id': 1,
-                'messages': self.db.get_messages(1)
-            })
+            # Отправляем историю всех чатов
+            for chat_id in [c['id'] for c in chats]:
+                await self.send(ws, {
+                    'type': 'history',
+                    'chat_id': chat_id,
+                    'messages': self.db.get_messages(chat_id)
+                })
             
             await self.broadcast_online()
             log.info(f"✅ Восстановлена сессия: {user['username']}")
@@ -872,6 +874,16 @@ class TelegramWhiteServer:
             
             if message_id and emoji:
                 self.db.add_reaction(message_id, user_id, emoji)
+                # Отправляем обновленные реакции
+                await self.broadcast({
+                    'type': 'reactions_updated',
+                    'message_id': message_id,
+                    'reactions': self.db.execute(
+                        "SELECT emoji, COUNT(*) as count FROM reactions WHERE message_id = %s GROUP BY emoji",
+                        (message_id,),
+                        fetch_all=True
+                    )
+                }, chat_id=chat_id)
             return
 
         # Получение профиля
