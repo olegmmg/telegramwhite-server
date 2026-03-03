@@ -241,22 +241,36 @@ class Database:
             if existing:
                 return None
 
-            # Создаем пользователя
-            user = self.execute("""
-                INSERT INTO users (username, email, password, last_seen, created_at)
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING id, username, email, bio, avatar_url, phone, created_at
-            """, (username, email, hashed, now, now), fetch_one=True)
-
-            # Добавляем в общий чат
-            self.execute("""
-                INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-                VALUES (1, %s, 'member', %s)
-                ON CONFLICT DO NOTHING
-            """, (user['id'], now))
-
-            log.info(f"✅ Новый пользователь: {username}")
-            return user
+            # Создаем пользователя в отдельной транзакции
+            conn = self.get_conn()
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            
+            try:
+                # Создаем пользователя
+                cur.execute("""
+                    INSERT INTO users (username, email, password, last_seen, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id, username, email, bio, avatar_url, phone, created_at
+                """, (username, email, hashed, now, now))
+                
+                user = dict(cur.fetchone())
+                
+                # Добавляем в общий чат
+                cur.execute("""
+                    INSERT INTO chat_members (chat_id, user_id, role, joined_at)
+                    VALUES (1, %s, 'member', %s)
+                    ON CONFLICT (chat_id, user_id) DO NOTHING
+                """, (user['id'], now))
+                
+                conn.commit()
+                log.info(f"✅ Новый пользователь: {username} (ID: {user['id']})")
+                return user
+                
+            except Exception as e:
+                conn.rollback()
+                raise e
+            finally:
+                self.put_conn(conn)
 
         except Exception as e:
             log.error(f"❌ Ошибка создания пользователя: {e}")
@@ -492,6 +506,7 @@ class TelegramWhiteServer:
                 'user': user,
                 'token': token
             })
+            log.info(f"✅ Регистрация успешна: {username}")
             return
 
         # Вход
@@ -503,6 +518,7 @@ class TelegramWhiteServer:
             
             user = self.db.verify_user(username, password)
             if not user:
+                log.warning(f"❌ Неверный пароль для {username}")
                 await self.send(ws, {'type': 'error', 'message': 'Неверный логин или пароль'})
                 return
             
@@ -670,6 +686,7 @@ class TelegramWhiteServer:
                 await self.broadcast_online()
             
             await self.send(ws, {'type': 'logged_out'})
+            log.info(f"👋 Выход: {username}")
             return
 
     async def handler(self, ws, path):
@@ -696,17 +713,20 @@ class TelegramWhiteServer:
         finally:
             # Очистка при отключении
             user_id = None
+            username = None
             for uid, conn in list(self.connections.items()):
                 if conn.ws == ws:
                     user_id = uid
                     username = conn.username
                     del self.connections[uid]
                     self.db.set_status(uid, 'offline')
-                    log.info(f"➖ Отключение: {username}")
                     break
             
             if user_id:
+                log.info(f"➖ Отключение: {username}")
                 await self.broadcast_online()
+            else:
+                log.info(f"➖ Отключение (без авторизации): {client_info}")
 
     async def run(self):
         """Запуск сервера"""
