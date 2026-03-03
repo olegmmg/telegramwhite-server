@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-TelegramWhite WebSocket Server - Полная версия
-Исправленное хеширование паролей
+TelegramWhite WebSocket Server - Исправленная версия
 """
 
 import os
@@ -12,7 +11,6 @@ import hashlib
 import time
 import logging
 from typing import Dict, Optional, Set, Any
-from datetime import datetime, timedelta
 
 import websockets
 import psycopg2
@@ -191,18 +189,6 @@ class Database:
                 created_at  BIGINT NOT NULL,
                 PRIMARY KEY (message_id, user_id)
             );
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_messages_chat_time 
-            ON messages(chat_id, created_at DESC);
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_users_status 
-            ON users(status);
-            """,
-            """
-            CREATE INDEX IF NOT EXISTS idx_sessions_expires 
-            ON sessions(expires_at);
             """
         ]
 
@@ -233,16 +219,13 @@ class Database:
 
     def hash_password(self, password: str) -> str:
         """Хеширование пароля"""
-        # Используем фиксированную соль для стабильности
-        salt = SECRET_KEY.encode('utf-8')
         return hashlib.pbkdf2_hmac(
             'sha256',
             password.encode('utf-8'),
-            salt,
+            SECRET_KEY.encode('utf-8'),
             100000
         ).hex()
 
-    # ==== Пользователи ====
     def create_user(self, username: str, password: str, email: str = "") -> Optional[dict]:
         """Создание нового пользователя"""
         now = int(time.time())
@@ -283,34 +266,12 @@ class Database:
         """Проверка логина и пароля"""
         hashed = self.hash_password(password)
         
-        # Сначала проверим существование пользователя
-        user_check = self.execute(
-            "SELECT password FROM users WHERE username = %s",
-            (username,),
-            fetch_one=True
-        )
-        
-        if not user_check:
-            log.warning(f"❌ Пользователь {username} не найден")
-            return None
-        
-        log.info(f"🔐 Проверка пароля для {username}")
-        log.info(f"   Введенный хеш: {hashed[:20]}...")
-        log.info(f"   Хеш в БД: {user_check['password'][:20]}...")
-        
-        if user_check['password'] != hashed:
-            log.warning(f"❌ Неверный пароль для {username}")
-            return None
-        
-        user = self.execute("""
+        return self.execute("""
             SELECT id, username, email, bio, avatar_url, phone, created_at,
                    messages_count, friends_count
             FROM users
             WHERE username = %s AND password = %s
         """, (username, hashed), fetch_one=True)
-        
-        log.info(f"✅ Успешный вход: {username}")
-        return user
 
     def get_user(self, user_id: int) -> Optional[dict]:
         """Получение пользователя по ID"""
@@ -329,40 +290,6 @@ class Database:
             WHERE username = %s
         """, (username,), fetch_one=True)
 
-    def update_profile(self, user_id: int, **kwargs) -> bool:
-        """Обновление профиля пользователя"""
-        allowed = ['bio', 'email', 'phone', 'avatar_url']
-        updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
-        
-        if not updates:
-            return False
-        
-        set_clause = ', '.join([f"{k} = %s" for k in updates.keys()])
-        query = f"UPDATE users SET {set_clause} WHERE id = %s"
-        
-        try:
-            self.execute(query, list(updates.values()) + [user_id])
-            return True
-        except:
-            return False
-
-    def change_password(self, user_id: int, old_password: str, new_password: str) -> bool:
-        """Смена пароля"""
-        user = self.execute(
-            "SELECT password FROM users WHERE id = %s",
-            (user_id,),
-            fetch_one=True
-        )
-        
-        if not user or user['password'] != self.hash_password(old_password):
-            return False
-        
-        self.execute(
-            "UPDATE users SET password = %s WHERE id = %s",
-            (self.hash_password(new_password), user_id)
-        )
-        return True
-
     def set_status(self, user_id: int, status: str):
         """Установка статуса пользователя"""
         self.execute(
@@ -370,7 +297,6 @@ class Database:
             (status, int(time.time()), user_id)
         )
 
-    # ==== Сессии ====
     def create_session(self, user_id: int) -> str:
         """Создание сессии"""
         token = hashlib.sha256(
@@ -398,104 +324,45 @@ class Database:
         """Удаление сессии"""
         self.execute("DELETE FROM sessions WHERE token = %s", (token,))
 
-    # ==== Чаты ====
     def get_user_chats(self, user_id: int) -> list:
         """Получение всех чатов пользователя"""
         return self.execute("""
-            SELECT 
-                c.id, c.name, c.type, c.description, c.avatar_url,
-                cm.role, cm.last_read,
-                (
-                    SELECT row_to_json(msg)
-                    FROM (
-                        SELECT m.text, m.username, m.created_at
-                        FROM messages m
-                        WHERE m.chat_id = c.id AND m.deleted = FALSE
-                        ORDER BY m.created_at DESC
-                        LIMIT 1
-                    ) msg
-                ) as last_message
+            SELECT c.id, c.name, c.type, c.description, c.avatar_url
             FROM chats c
             JOIN chat_members cm ON cm.chat_id = c.id
             WHERE cm.user_id = %s
-            ORDER BY (
-                SELECT COALESCE(MAX(created_at), 0)
-                FROM messages
-                WHERE chat_id = c.id
-            ) DESC
+            ORDER BY c.id
         """, (user_id,), fetch_all=True)
 
-    def create_group(self, name: str, description: str, creator_id: int, members: list) -> Optional[dict]:
-        """Создание группы"""
-        now = int(time.time())
-        try:
-            # Создаем чат
-            chat = self.execute("""
-                INSERT INTO chats (name, type, description, created_by, created_at)
-                VALUES (%s, 'group', %s, %s, %s)
-                RETURNING id, name, type, description, avatar_url, created_at
-            """, (name, description, creator_id, now), fetch_one=True)
+    def get_messages(self, chat_id: int, limit: int = 50) -> list:
+        """Получение сообщений чата"""
+        msgs = self.execute("""
+            SELECT * FROM messages
+            WHERE chat_id = %s AND deleted = FALSE
+            ORDER BY created_at ASC
+            LIMIT %s
+        """, (chat_id, limit), fetch_all=True)
+        
+        return msgs if msgs else []
 
-            # Добавляем создателя
-            self.execute("""
-                INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-                VALUES (%s, %s, 'owner', %s)
-            """, (chat['id'], creator_id, now))
+    def save_message(self, chat_id: int, user_id: int, username: str, text: str) -> dict:
+        """Сохранение сообщения"""
+        msg = self.execute("""
+            INSERT INTO messages (chat_id, user_id, username, text, created_at)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id, chat_id, user_id, username, text, created_at
+        """, (chat_id, user_id, username, text, int(time.time())), fetch_one=True)
 
-            # Добавляем остальных участников
-            for member_id in members:
-                if member_id != creator_id:
-                    self.execute("""
-                        INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-                        VALUES (%s, %s, 'member', %s)
-                        ON CONFLICT DO NOTHING
-                    """, (chat['id'], member_id, now))
+        return msg
 
-            log.info(f"✅ Группа создана: {name}")
-            return chat
-
-        except Exception as e:
-            log.error(f"❌ Ошибка создания группы: {e}")
-            return None
-
-    def get_chat_info(self, chat_id: int) -> Optional[dict]:
-        """Получение информации о чате"""
+    def get_online_users(self) -> list:
+        """Получение списка онлайн пользователей"""
         return self.execute("""
-            SELECT id, name, type, description, avatar_url, created_by, created_at
-            FROM chats
-            WHERE id = %s
-        """, (chat_id,), fetch_one=True)
-
-    def get_chat_members(self, chat_id: int) -> list:
-        """Получение участников чата"""
-        return self.execute("""
-            SELECT u.id, u.username, u.avatar_url, u.status, cm.role, cm.joined_at
-            FROM users u
-            JOIN chat_members cm ON cm.user_id = u.id
-            WHERE cm.chat_id = %s
-            ORDER BY 
-                CASE cm.role 
-                    WHEN 'owner' THEN 1
-                    WHEN 'admin' THEN 2
-                    ELSE 3
-                END,
-                u.username
-        """, (chat_id,), fetch_all=True)
-
-    def add_member(self, chat_id: int, user_id: int):
-        """Добавление участника в чат"""
-        self.execute("""
-            INSERT INTO chat_members (chat_id, user_id, role, joined_at)
-            VALUES (%s, %s, 'member', %s)
-            ON CONFLICT DO NOTHING
-        """, (chat_id, user_id, int(time.time())))
-
-    def remove_member(self, chat_id: int, user_id: int):
-        """Удаление участника из чата"""
-        self.execute("""
-            DELETE FROM chat_members
-            WHERE chat_id = %s AND user_id = %s
-        """, (chat_id, user_id))
+            SELECT id, username, avatar_url, status
+            FROM users
+            WHERE status = 'online'
+            ORDER BY username
+        """, fetch_all=True)
 
     def get_or_create_private(self, user1_id: int, user2_id: int, user2_name: str) -> dict:
         """Получение или создание личного чата"""
@@ -531,112 +398,6 @@ class Database:
 
         return chat
 
-    # ==== Сообщения ====
-    def save_message(self, chat_id: int, user_id: int, username: str, text: str) -> dict:
-        """Сохранение сообщения"""
-        msg = self.execute("""
-            INSERT INTO messages (chat_id, user_id, username, text, created_at)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id, chat_id, user_id, username, text, created_at
-        """, (chat_id, user_id, username, text, int(time.time())), fetch_one=True)
-
-        # Обновляем счетчики
-        self.execute(
-            "UPDATE users SET messages_count = messages_count + 1 WHERE id = %s",
-            (user_id,)
-        )
-        self.execute(
-            "UPDATE chats SET messages_count = messages_count + 1 WHERE id = %s",
-            (chat_id,)
-        )
-
-        return msg
-
-    def get_messages(self, chat_id: int, limit: int = 50, before_id: int = None) -> list:
-        """Получение сообщений чата"""
-        if before_id:
-            msgs = self.execute("""
-                SELECT m.*, 
-                       (
-                           SELECT json_object_agg(emoji, cnt)
-                           FROM (
-                               SELECT emoji, COUNT(*) as cnt
-                               FROM reactions
-                               WHERE message_id = m.id
-                               GROUP BY emoji
-                           ) r
-                       ) as reactions
-                FROM messages m
-                WHERE m.chat_id = %s 
-                    AND m.deleted = FALSE
-                    AND m.id < %s
-                ORDER BY m.created_at DESC
-                LIMIT %s
-            """, (chat_id, before_id, limit), fetch_all=True)
-        else:
-            msgs = self.execute("""
-                SELECT m.*, 
-                       (
-                           SELECT json_object_agg(emoji, cnt)
-                           FROM (
-                               SELECT emoji, COUNT(*) as cnt
-                               FROM reactions
-                               WHERE message_id = m.id
-                               GROUP BY emoji
-                           ) r
-                       ) as reactions
-                FROM messages m
-                WHERE m.chat_id = %s AND m.deleted = FALSE
-                ORDER BY m.created_at DESC
-                LIMIT %s
-            """, (chat_id, limit), fetch_all=True)
-        
-        return list(reversed(msgs)) if msgs else []
-
-    def add_reaction(self, message_id: int, user_id: int, emoji: str):
-        """Добавление реакции"""
-        self.execute("""
-            INSERT INTO reactions (message_id, user_id, emoji, created_at)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (message_id, user_id) 
-            DO UPDATE SET emoji = %s
-        """, (message_id, user_id, emoji, int(time.time()), emoji))
-
-    # ==== Звонки ====
-    def create_call(self, chat_id: int, initiator_id: int, call_type: str = 'audio') -> Optional[dict]:
-        """Создание звонка"""
-        return self.execute("""
-            INSERT INTO calls (chat_id, initiator, type, status, started_at)
-            VALUES (%s, %s, %s, 'ringing', %s)
-            RETURNING id, chat_id, type, status, started_at
-        """, (chat_id, initiator_id, call_type, int(time.time())), fetch_one=True)
-
-    def end_call(self, call_id: int):
-        """Завершение звонка"""
-        now = int(time.time())
-        call = self.execute(
-            "SELECT started_at FROM calls WHERE id = %s",
-            (call_id,),
-            fetch_one=True
-        )
-        
-        if call:
-            duration = now - call['started_at']
-            self.execute("""
-                UPDATE calls 
-                SET status = 'ended', ended_at = %s, duration = %s
-                WHERE id = %s
-            """, (now, duration, call_id))
-
-    def get_online_users(self) -> list:
-        """Получение списка онлайн пользователей"""
-        return self.execute("""
-            SELECT id, username, avatar_url, status
-            FROM users
-            WHERE status = 'online'
-            ORDER BY username
-        """, fetch_all=True)
-
 
 class Connection:
     """Информация о подключении клиента"""
@@ -645,7 +406,6 @@ class Connection:
         self.user_id = user_id
         self.username = username
         self.current_chat = 1
-        self.connected_at = time.time()
         self.last_ping = time.time()
 
 
@@ -654,14 +414,12 @@ class TelegramWhiteServer:
     
     def __init__(self):
         log.info("=" * 50)
-        log.info("🚀 TelegramWhite Server (Полная версия)")
+        log.info("🚀 TelegramWhite Server")
         log.info("=" * 50)
         log.info(f"Порт: {PORT}")
-        log.info(f"Secret Key: {SECRET_KEY[:10]}...")
         
         self.db = Database(DATABASE_URL)
         self.connections: Dict[int, Connection] = {}
-        self.active_calls: Dict[int, dict] = {}
         
         log.info("✅ Сервер инициализирован")
 
@@ -677,20 +435,9 @@ class TelegramWhiteServer:
         message = json.dumps(data, ensure_ascii=False)
         
         targets = []
-        if chat_id:
-            # Получаем участников чата
-            members = self.db.get_chat_members(chat_id)
-            member_ids = {m['id'] for m in members} if members else set()
-            targets = [
-                conn.ws for uid, conn in self.connections.items()
-                if uid in member_ids and uid != skip_user
-            ]
-        else:
-            # Всем пользователям
-            targets = [
-                conn.ws for uid, conn in self.connections.items()
-                if uid != skip_user
-            ]
+        for uid, conn in self.connections.items():
+            if uid != skip_user:
+                targets.append(conn.ws)
         
         if targets:
             await asyncio.gather(
@@ -705,25 +452,27 @@ class TelegramWhiteServer:
             'users': self.db.get_online_users()
         })
 
-    async def handle_message(self, ws, data: dict, user_id: int = None):
+    async def handle_message(self, ws, data: dict):
         """Обработка входящих сообщений"""
         msg_type = data.get('type')
         
         if not msg_type:
             return
 
-        # Ping/Pong для поддержания соединения
+        log.info(f"📨 Получено сообщение типа: {msg_type}")
+
+        # Ping/Pong
         if msg_type == 'ping':
-            if user_id and user_id in self.connections:
-                self.connections[user_id].last_ping = time.time()
             await self.send(ws, {'type': 'pong'})
             return
 
-        # === Регистрация ===
+        # Регистрация
         if msg_type == 'register':
             username = data.get('username', '').strip()
             password = data.get('password', '')
             email = data.get('email', '').strip()
+            
+            log.info(f"📝 Регистрация: {username}")
             
             if len(username) < 3:
                 await self.send(ws, {'type': 'error', 'message': 'Имя должно содержать минимум 3 символа'})
@@ -743,13 +492,14 @@ class TelegramWhiteServer:
                 'user': user,
                 'token': token
             })
-            log.info(f"✅ Регистрация: {username}")
             return
 
-        # === Вход ===
+        # Вход
         if msg_type == 'login':
             username = data.get('username', '').strip()
             password = data.get('password', '')
+            
+            log.info(f"🔑 Вход: {username}")
             
             user = self.db.verify_user(username, password)
             if not user:
@@ -787,12 +537,12 @@ class TelegramWhiteServer:
                 'type': 'system',
                 'chat_id': 1,
                 'text': f'👋 {username} присоединился'
-            }, chat_id=1, skip_user=user['id'])
+            }, skip_user=user['id'])
             
-            log.info(f"✅ Вход: {username}")
+            log.info(f"✅ Успешный вход: {username}")
             return
 
-        # === Восстановление сессии ===
+        # Восстановление сессии
         if msg_type == 'session':
             token = data.get('token', '')
             user_id = self.db.check_session(token)
@@ -827,39 +577,32 @@ class TelegramWhiteServer:
             log.info(f"✅ Восстановлена сессия: {user['username']}")
             return
 
-        # === Проверка авторизации для остальных методов ===
-        if not user_id or user_id not in self.connections:
+        # Проверка авторизации для остальных методов
+        user_id = None
+        for uid, conn in self.connections.items():
+            if conn.ws == ws:
+                user_id = uid
+                break
+        
+        if not user_id:
             await self.send(ws, {'type': 'error', 'message': 'Требуется авторизация'})
             return
 
         conn = self.connections[user_id]
 
-        # === Отправка сообщения ===
+        # Отправка сообщения
         if msg_type == 'send_message':
             chat_id = data.get('chat_id', 1)
             text = data.get('text', '').strip()
             
-            if not text or len(text) > MAX_MESSAGE_LENGTH:
-                await self.send(ws, {'type': 'error', 'message': 'Некорректное сообщение'})
+            if not text:
                 return
             
             msg = self.db.save_message(chat_id, user_id, conn.username, text)
             await self.broadcast({'type': 'message', 'message': msg}, chat_id=chat_id)
             return
 
-        # === Получение истории ===
-        if msg_type == 'get_history':
-            chat_id = data.get('chat_id', 1)
-            before_id = data.get('before_id')
-            messages = self.db.get_messages(chat_id, before_id=before_id)
-            await self.send(ws, {
-                'type': 'history',
-                'chat_id': chat_id,
-                'messages': messages
-            })
-            return
-
-        # === Смена чата ===
+        # Смена чата
         if msg_type == 'switch_chat':
             chat_id = data.get('chat_id', 1)
             conn.current_chat = chat_id
@@ -871,172 +614,17 @@ class TelegramWhiteServer:
             })
             return
 
-        # === Печатает... ===
+        # Печатает...
         if msg_type == 'typing':
             chat_id = data.get('chat_id', 1)
             await self.broadcast({
                 'type': 'typing',
                 'username': conn.username,
                 'chat_id': chat_id
-            }, chat_id=chat_id, skip_user=user_id)
+            }, skip_user=user_id)
             return
 
-        # === Реакции ===
-        if msg_type == 'react':
-            message_id = data.get('message_id')
-            emoji = data.get('emoji')
-            chat_id = data.get('chat_id', 1)
-            
-            if message_id and emoji:
-                self.db.add_reaction(message_id, user_id, emoji)
-            return
-
-        # === Получение профиля ===
-        if msg_type == 'get_profile':
-            target = data.get('username')
-            if target:
-                profile = self.db.get_user_by_username(target)
-            else:
-                profile = self.db.get_user(user_id)
-            
-            if not profile:
-                await self.send(ws, {'type': 'error', 'message': 'Пользователь не найден'})
-                return
-            
-            await self.send(ws, {'type': 'profile', 'user': profile})
-            return
-
-        # === Обновление профиля ===
-        if msg_type == 'update_profile':
-            bio = data.get('bio')
-            email = data.get('email')
-            phone = data.get('phone')
-            avatar = data.get('avatar')
-            
-            self.db.update_profile(
-                user_id,
-                bio=bio,
-                email=email,
-                phone=phone,
-                avatar_url=avatar
-            )
-            
-            user = self.db.get_user(user_id)
-            await self.send(ws, {'type': 'profile_updated', 'user': user})
-            return
-
-        # === Смена пароля ===
-        if msg_type == 'change_password':
-            old_pass = data.get('old_password', '')
-            new_pass = data.get('new_password', '')
-            
-            if len(new_pass) < 6:
-                await self.send(ws, {'type': 'error', 'message': 'Минимальная длина пароля 6 символов'})
-                return
-            
-            if self.db.change_password(user_id, old_pass, new_pass):
-                await self.send(ws, {'type': 'password_changed'})
-            else:
-                await self.send(ws, {'type': 'error', 'message': 'Неверный текущий пароль'})
-            return
-
-        # === Создание группы ===
-        if msg_type == 'create_group':
-            name = data.get('name', '').strip()
-            description = data.get('description', '').strip()
-            members = data.get('members', [])
-            
-            if not name:
-                await self.send(ws, {'type': 'error', 'message': 'Введите название группы'})
-                return
-            
-            # Получаем ID участников
-            member_ids = [user_id]
-            for username in members:
-                user = self.db.get_user_by_username(username)
-                if user:
-                    member_ids.append(user['id'])
-            
-            chat = self.db.create_group(name, description, user_id, member_ids)
-            if not chat:
-                await self.send(ws, {'type': 'error', 'message': 'Ошибка создания группы'})
-                return
-            
-            # Оповещаем участников
-            members_info = self.db.get_chat_members(chat['id'])
-            for member in members_info:
-                if member['id'] in self.connections and member['id'] != user_id:
-                    await self.send(self.connections[member['id']].ws, {
-                        'type': 'new_group_chat',
-                        'chat': {**chat, 'type': 'group'}
-                    })
-            
-            await self.send(ws, {
-                'type': 'group_created',
-                'chat': {**chat, 'type': 'group'},
-                'members': members_info
-            })
-            
-            log.info(f"✅ Группа создана: {name}")
-            return
-
-        # === Информация о чате ===
-        if msg_type == 'get_chat_info':
-            chat_id = data.get('chat_id')
-            chat = self.db.get_chat_info(chat_id)
-            members = self.db.get_chat_members(chat_id)
-            
-            await self.send(ws, {
-                'type': 'chat_info',
-                'chat': chat,
-                'members': members
-            })
-            return
-
-        # === Добавление участника ===
-        if msg_type == 'add_member':
-            chat_id = data.get('chat_id')
-            username = data.get('username', '').strip()
-            
-            target = self.db.get_user_by_username(username)
-            if not target:
-                await self.send(ws, {'type': 'error', 'message': 'Пользователь не найден'})
-                return
-            
-            self.db.add_member(chat_id, target['id'])
-            
-            # Оповещаем нового участника
-            if target['id'] in self.connections:
-                chat = self.db.get_chat_info(chat_id)
-                await self.send(self.connections[target['id']].ws, {
-                    'type': 'added_to_chat',
-                    'chat': {**chat, 'type': 'group'}
-                })
-            
-            await self.broadcast({
-                'type': 'system',
-                'chat_id': chat_id,
-                'text': f'➕ {username} присоединился к группе'
-            }, chat_id=chat_id)
-            return
-
-        # === Выход из группы ===
-        if msg_type == 'leave_chat':
-            chat_id = data.get('chat_id')
-            username = conn.username
-            
-            self.db.remove_member(chat_id, user_id)
-            
-            await self.broadcast({
-                'type': 'system',
-                'chat_id': chat_id,
-                'text': f'👋 {username} покинул группу'
-            }, chat_id=chat_id)
-            
-            await self.send(ws, {'type': 'left_chat', 'chat_id': chat_id})
-            return
-
-        # === Личный чат ===
+        # Личный чат
         if msg_type == 'start_private':
             target_name = data.get('username', '').strip()
             target = self.db.get_user_by_username(target_name)
@@ -1073,140 +661,15 @@ class TelegramWhiteServer:
             log.info(f"💬 Личный чат: {conn.username} - {target_name}")
             return
 
-        # === Звонки ===
-        if msg_type == 'call_start':
-            chat_id = data.get('chat_id')
-            call_type = data.get('call_type', 'audio')
-            
-            call = self.db.create_call(chat_id, user_id, call_type)
-            if not call:
-                await self.send(ws, {'type': 'error', 'message': 'Не удалось начать звонок'})
-                return
-            
-            self.active_calls[call['id']] = {
-                'chat_id': chat_id,
-                'type': call_type,
-                'initiator': user_id,
-                'participants': {user_id}
-            }
-            
-            # Оповещаем всех в чате
-            await self.broadcast({
-                'type': 'incoming_call',
-                'call_id': call['id'],
-                'chat_id': chat_id,
-                'call_type': call_type,
-                'from': conn.username,
-                'from_id': user_id,
-                'avatar': None
-            }, chat_id=chat_id, skip_user=user_id)
-            
-            await self.send(ws, {
-                'type': 'call_started',
-                'call_id': call['id'],
-                'call_type': call_type
-            })
-            
-            log.info(f"📞 Звонок начат: {call_type} в чате {chat_id}")
-            return
-
-        if msg_type == 'call_accept':
-            call_id = data.get('call_id')
-            if call_id not in self.active_calls:
-                return
-            
-            call = self.active_calls[call_id]
-            call['participants'].add(user_id)
-            
-            # Оповещаем инициатора
-            initiator_id = call['initiator']
-            if initiator_id in self.connections:
-                await self.send(self.connections[initiator_id].ws, {
-                    'type': 'call_accepted',
-                    'call_id': call_id,
-                    'by': conn.username,
-                    'by_id': user_id
-                })
-            
-            await self.send(ws, {'type': 'call_joined', 'call_id': call_id})
-            return
-
-        if msg_type == 'call_decline':
-            call_id = data.get('call_id')
-            if call_id not in self.active_calls:
-                return
-            
-            call = self.active_calls[call_id]
-            initiator_id = call['initiator']
-            
-            if initiator_id in self.connections:
-                await self.send(self.connections[initiator_id].ws, {
-                    'type': 'call_declined',
-                    'call_id': call_id,
-                    'by': conn.username
-                })
-            return
-
-        if msg_type == 'call_end':
-            call_id = data.get('call_id')
-            if call_id in self.active_calls:
-                call = self.active_calls[call_id]
-                self.db.end_call(call_id)
-                
-                await self.broadcast({
-                    'type': 'call_ended',
-                    'call_id': call_id
-                }, chat_id=call['chat_id'])
-                
-                del self.active_calls[call_id]
-            return
-
-        # === WebRTC сигнализация ===
-        if msg_type in ['webrtc_offer', 'webrtc_answer', 'webrtc_ice']:
-            target_id = data.get('target_id')
-            if target_id in self.connections:
-                await self.send(self.connections[target_id].ws, {
-                    'type': msg_type,
-                    'call_id': data.get('call_id'),
-                    'offer' if msg_type == 'webrtc_offer' else 
-                    'answer' if msg_type == 'webrtc_answer' else 
-                    'candidate': data.get('offer' if msg_type == 'webrtc_offer' else 
-                                         'answer' if msg_type == 'webrtc_answer' else 
-                                         'candidate'),
-                    'from_id': user_id
-                })
-            return
-
-        # === Выход ===
+        # Выход
         if msg_type == 'logout':
-            token = data.get('token', '')
-            if token:
-                self.db.delete_session(token)
-            
             if user_id in self.connections:
                 username = self.connections[user_id].username
                 del self.connections[user_id]
-                
                 self.db.set_status(user_id, 'offline')
-                
-                await self.broadcast({
-                    'type': 'system',
-                    'chat_id': 1,
-                    'text': f'🔴 {username} вышел'
-                }, chat_id=1)
-                
                 await self.broadcast_online()
             
             await self.send(ws, {'type': 'logged_out'})
-            log.info(f"👋 Выход: user_id={user_id}")
-            return
-
-        # === Получение списка онлайн ===
-        if msg_type == 'get_online':
-            await self.send(ws, {
-                'type': 'online_users',
-                'users': self.db.get_online_users()
-            })
             return
 
     async def handler(self, ws, path):
@@ -1214,78 +677,36 @@ class TelegramWhiteServer:
         client_info = f"{ws.remote_address[0]}:{ws.remote_address[1]}"
         log.info(f"➕ Новое подключение: {client_info}")
         
-        user_id = None
         try:
             async for message in ws:
                 try:
                     data = json.loads(message)
-                    await self.handle_message(ws, data, user_id)
-                    
+                    await self.handle_message(ws, data)
                 except json.JSONDecodeError:
+                    log.error(f"❌ Неверный JSON: {message[:100]}")
                     await self.send(ws, {'type': 'error', 'message': 'Неверный JSON'})
                 except Exception as e:
                     log.error(f"❌ Ошибка обработки: {e}", exc_info=True)
-                    await self.send(ws, {'type': 'error', 'message': 'Внутренняя ошибка сервера'})
+                    await self.send(ws, {'type': 'error', 'message': 'Внутренняя ошибка'})
         
         except websockets.exceptions.ConnectionClosed:
-            log.debug(f"📴 Соединение закрыто: {client_info}")
+            log.info(f"📴 Соединение закрыто: {client_info}")
         except Exception as e:
-            log.error(f"❌ Ошибка соединения: {e}")
+            log.error(f"❌ Ошибка: {e}")
         finally:
             # Очистка при отключении
-            if user_id and user_id in self.connections:
-                username = self.connections[user_id].username
-                
-                # Завершаем активные звонки
-                for call_id, call in list(self.active_calls.items()):
-                    if user_id in call['participants']:
-                        self.db.end_call(call_id)
-                        await self.broadcast({
-                            'type': 'call_ended',
-                            'call_id': call_id
-                        }, chat_id=call['chat_id'])
-                        del self.active_calls[call_id]
-                
-                del self.connections[user_id]
-                self.db.set_status(user_id, 'offline')
-                
-                # Оповещаем всех
-                await self.broadcast({
-                    'type': 'system',
-                    'chat_id': 1,
-                    'text': f'🔴 {username} отключился'
-                }, chat_id=1)
+            user_id = None
+            for uid, conn in list(self.connections.items()):
+                if conn.ws == ws:
+                    user_id = uid
+                    username = conn.username
+                    del self.connections[uid]
+                    self.db.set_status(uid, 'offline')
+                    log.info(f"➖ Отключение: {username}")
+                    break
+            
+            if user_id:
                 await self.broadcast_online()
-                
-                log.info(f"➖ Отключение: {username}")
-            else:
-                log.info(f"➖ Отключение (без авторизации): {client_info}")
-
-    async def ping_checker(self):
-        """Проверка активности соединений"""
-        while True:
-            await asyncio.sleep(30)
-            now = time.time()
-            for user_id, conn in list(self.connections.items()):
-                if now - conn.last_ping > PING_TIMEOUT * 3:
-                    log.warning(f"⚠️ Таймаут ping для user_id={user_id}")
-                    try:
-                        await conn.ws.close()
-                    except:
-                        pass
-
-    async def cleanup_old_sessions(self):
-        """Очистка старых сессий (раз в час)"""
-        while True:
-            await asyncio.sleep(3600)
-            try:
-                self.db.execute(
-                    "DELETE FROM sessions WHERE expires_at < %s",
-                    (int(time.time()),)
-                )
-                log.info("🧹 Очистка старых сессий выполнена")
-            except Exception as e:
-                log.error(f"❌ Ошибка очистки сессий: {e}")
 
     async def run(self):
         """Запуск сервера"""
@@ -1296,14 +717,9 @@ class TelegramWhiteServer:
             HOST,
             PORT,
             ping_interval=PING_INTERVAL,
-            ping_timeout=PING_TIMEOUT,
-            max_size=10 * 1024 * 1024
+            ping_timeout=PING_TIMEOUT
         ):
             log.info(f"✅ Сервер запущен и слушает порт {PORT}")
-            
-            # Запускаем фоновые задачи
-            asyncio.create_task(self.ping_checker())
-            asyncio.create_task(self.cleanup_old_sessions())
             
             # Бесконечное ожидание
             await asyncio.Future()
