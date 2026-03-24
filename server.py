@@ -179,7 +179,6 @@ class Database:
                 user_id    INTEGER REFERENCES users(id),
                 username   TEXT NOT NULL,
                 text       TEXT NOT NULL,
-                is_system  BOOLEAN DEFAULT FALSE,
                 created_at BIGINT NOT NULL DEFAULT 0,
                 deleted    BOOLEAN DEFAULT FALSE
             )""",
@@ -433,49 +432,48 @@ class Database:
         self.execute("DELETE FROM chat_members WHERE chat_id=%s AND user_id=%s", (chat_id, user_id))
 
     # ── Messages ────────────────────────────────────────────────────────
- def get_messages(self, chat_id: int, limit: int = MAX_HISTORY) -> list:
-    try:
-        rows = self.execute("""
-            SELECT id, chat_id, user_id, username, text, created_at
-            FROM (
+    def get_messages(self, chat_id: int, limit: int = MAX_HISTORY) -> list:
+        try:
+            rows = self.execute("""
                 SELECT id, chat_id, user_id, username, text, created_at
-                FROM messages 
-                WHERE chat_id=%s AND deleted=FALSE
-                ORDER BY id DESC LIMIT %s
-            ) sub ORDER BY id ASC
-        """, (chat_id, limit), all=True)
-        return rows or []
-    except Exception as e:
-        log.error(f"❌ get_messages: {e}")
-        return []
+                FROM (
+                    SELECT id, chat_id, user_id, username, text, created_at
+                    FROM messages WHERE chat_id=%s AND deleted=FALSE
+                    ORDER BY id DESC LIMIT %s
+                ) sub ORDER BY id ASC
+            """, (chat_id, limit), all=True)
+            return rows or []
+        except Exception as e:
+            log.error(f"❌ get_messages: {e}")
+            return []
 
-  def save_message(self, chat_id: int, user_id: int, username: str, text: str,
-                 is_system: bool = False) -> Optional[dict]:
-    conn = None
-    try:
-        conn = self._get()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(
-            "INSERT INTO messages (chat_id,user_id,username,text,created_at,deleted) "
-            "VALUES (%s,%s,%s,%s,%s,FALSE) "
-            "RETURNING id, chat_id, user_id, username, text, created_at",
-            (chat_id, user_id, username, text, int(time.time()))
-        )
-        msg = dict(cur.fetchone())
-        if not is_system:
+    def save_message(self, chat_id: int, user_id: int, username: str, text: str,
+                     is_system: bool = False) -> Optional[dict]:
+        conn = None
+        try:
+            conn = self._get()
+            cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cur.execute(
-                "UPDATE users SET messages_count=messages_count+1 WHERE id=%s", (user_id,)
+                "INSERT INTO messages (chat_id,user_id,username,text,created_at,deleted) "
+                "VALUES (%s,%s,%s,%s,%s,FALSE) "
+                "RETURNING id, chat_id, user_id, username, text, created_at",
+                (chat_id, user_id, username, text, int(time.time()))
             )
-        conn.commit()
-        return msg
-    except Exception as e:
-        if conn:
-            try: conn.rollback()
-            except: pass
-        log.error(f"❌ save_message: {e}")
-        return None
-    finally:
-        self._put(conn)
+            msg = dict(cur.fetchone())
+            if not is_system:
+                cur.execute(
+                    "UPDATE users SET messages_count=messages_count+1 WHERE id=%s", (user_id,)
+                )
+            conn.commit()
+            return msg
+        except Exception as e:
+            if conn:
+                try: conn.rollback()
+                except: pass
+            log.error(f"❌ save_message: {e}")
+            return None
+        finally:
+            self._put(conn)
 
     # ── Online ──────────────────────────────────────────────────────────
     def get_online(self) -> list:
