@@ -433,13 +433,14 @@ class Database:
         self.execute("DELETE FROM chat_members WHERE chat_id=%s AND user_id=%s", (chat_id, user_id))
 
     # ── Messages ────────────────────────────────────────────────────────
-  def get_messages(self, chat_id: int, limit: int = MAX_HISTORY) -> list:
+ def get_messages(self, chat_id: int, limit: int = MAX_HISTORY) -> list:
     try:
         rows = self.execute("""
             SELECT id, chat_id, user_id, username, text, created_at
             FROM (
                 SELECT id, chat_id, user_id, username, text, created_at
-                FROM messages WHERE chat_id=%s AND deleted=FALSE
+                FROM messages 
+                WHERE chat_id=%s AND deleted=FALSE
                 ORDER BY id DESC LIMIT %s
             ) sub ORDER BY id ASC
         """, (chat_id, limit), all=True)
@@ -448,12 +449,12 @@ class Database:
         log.error(f"❌ get_messages: {e}")
         return []
 
-   def save_message(self, chat_id: int, user_id: int, username: str, text: str,
+  def save_message(self, chat_id: int, user_id: int, username: str, text: str,
                  is_system: bool = False) -> Optional[dict]:
     conn = None
     try:
         conn = self._get()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
             "INSERT INTO messages (chat_id,user_id,username,text,created_at,deleted) "
             "VALUES (%s,%s,%s,%s,%s,FALSE) "
