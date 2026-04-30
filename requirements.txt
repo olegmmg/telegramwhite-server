@@ -1,4 +1,4 @@
-websockets
-psycopg2-binary
-Flask
-PyGithub
+websockets==12.0
+psycopg2-binary==2.9.9
+Flask==2.3.3
+PyGithub==2.1.1
