@@ -1,17 +1,17 @@
 services:
   - type: web
-    name: telegramwhite-server
+    name: combined-server
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python server.py
+    startCommand: python render-combined.py
     envVars:
-      - key: TW_SECRET
-        generateValue: true
+      - key: PORT
+        value: 10000
       - key: DATABASE_URL
         fromDatabase:
-          name: telegramwhite-db
+          name: your-db
           property: connectionString
-
-databases:
-  - name: telegramwhite-db
-    plan: free
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: FIREBASE_SECRET
+        sync: false
